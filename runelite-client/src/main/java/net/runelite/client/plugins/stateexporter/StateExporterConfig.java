@@ -7,63 +7,31 @@ import net.runelite.client.config.ConfigItem;
 @ConfigGroup("stateexporter")
 public interface StateExporterConfig extends Config
 {
-    // Add config options here as needed for the State Exporter plugin
-
     @ConfigItem(
         keyName = "outputPath",
         name = "Output Path",
         description = "Path to write the exported game state JSON file"
     )
-    default String outputPath() { return "C:/temp/runelite_gamestate.json"; }
+    default String outputPath() { return "D:\\cursor_projects\\osrs_learner\\bot_runelite_IL\\data\\runelite_gamestate.json"; }
 
     @ConfigItem(
-        keyName = "exportFrequency",
-        name = "Export Frequency",
-        description = "How often to export state (every tick, on event, manual)"
+        keyName = "screenshotDir",
+        name = "Screenshot Directory",
+        description = "Directory to save screenshots with matching timestamp filenames"
     )
-    default ExportFrequency exportFrequency() { return ExportFrequency.EVERY_TICK; }
+    default String screenshotDir() { return "D:\\cursor_projects\\osrs_learner\\bot_runelite_IL\\data\\runelite_screenshots\\"; }
 
     @ConfigItem(
-        keyName = "includePlayer",
-        name = "Include Player State",
-        description = "Include player info in export"
+        keyName = "enableDataSaving",
+        name = "Enable Data Saving",
+        description = "If enabled, the plugin will save screenshots and per-tick JSONs to the directories used by the IL data processing module. The main runelite_gamestate.json is always updated."
     )
-    default boolean includePlayer() { return true; }
+    default boolean enableDataSaving() { return true; }
 
     @ConfigItem(
-        keyName = "includeObjects",
-        name = "Include Game Objects",
-        description = "Include game objects (trees, banks, etc.)"
+        keyName = "perTickJsonDir",
+        name = "Per-Tick JSON Directory",
+        description = "Directory to save per-tick game state JSONs for IL training"
     )
-    default boolean includeObjects() { return true; }
-
-    @ConfigItem(
-        keyName = "includeNpcs",
-        name = "Include NPCs",
-        description = "Include NPCs in export"
-    )
-    default boolean includeNpcs() { return true; }
-
-    @ConfigItem(
-        keyName = "includeInventory",
-        name = "Include Inventory",
-        description = "Include inventory contents"
-    )
-    default boolean includeInventory() { return true; }
-
-    @ConfigItem(
-        keyName = "includeDialog",
-        name = "Include Dialogs/Widgets",
-        description = "Include open dialog and widget info"
-    )
-    default boolean includeDialog() { return true; }
-
-    // Add more config options as needed for extensibility
-
-    enum ExportFrequency
-    {
-        EVERY_TICK,
-        ON_EVENT,
-        MANUAL
-    }
+    default String perTickJsonDir() { return "D:\\cursor_projects\\osrs_learner\\bot_runelite_IL\\data\\gamestates\\"; }
 }
