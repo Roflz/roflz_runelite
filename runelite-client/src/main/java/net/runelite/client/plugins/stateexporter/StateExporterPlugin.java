@@ -58,6 +58,15 @@ public class StateExporterPlugin extends Plugin {
     private int lastPlayerX = -1;
     private int lastPlayerY = -1;
 
+    // Phase tracking fields for temporal context
+    private String currentPhase = "unknown";
+    private String previousPhase = "unknown";
+    private long phaseStartTime = 0;
+    private int gamestateCountInPhase = 0;
+    
+    // Crafting state tracking
+    private boolean isCraftingActive = false;
+
     // Call this method from your bot logic to update last action
     public void setLastAction(String action) {
         this.lastAction = action;
@@ -180,6 +189,218 @@ public class StateExporterPlugin extends Plugin {
         }
     }
 
+    // Phase detection method
+    private String detectCurrentPhase() {
+        // Check bank status
+        boolean bankOpen = isBankOpen();
+        
+        // Check crafting interface
+        boolean craftingOpen = isCraftingInterfaceOpen();
+        
+        // Check inventory contents
+        boolean hasMaterials = hasCraftingMaterials();
+        
+        // Update crafting state
+        if (craftingOpen) {
+            // Interface opened - start crafting phase
+            isCraftingActive = true;
+        } else if (!hasMaterials && isCraftingActive) {
+            // Materials consumed while crafting was active - end crafting phase
+            isCraftingActive = false;
+        }
+        
+        if (bankOpen) {
+            return "banking";
+        } else if (isCraftingActive) {
+            return "crafting";
+        } else if (!bankOpen && !isCraftingActive && hasMaterials) {
+            return "moving_to_furnace";
+        } else if (!bankOpen && !isCraftingActive && !hasMaterials) {
+            return "moving_to_bank";
+        }
+        
+        return "unknown";
+    }
+
+    // Helper method to check if bank interface is open
+    private boolean isBankOpen() {
+        Widget bankWidget = client.getWidget(WidgetInfo.BANK_CONTAINER);
+        return bankWidget != null && !bankWidget.isHidden();
+    }
+
+    // Helper method to check if crafting interface is visible
+    private boolean isCraftingInterfaceOpen() {
+        // Check for the correct crafting interface widget ID
+        Widget craftingWidget = client.getWidget(29229056);
+        if (craftingWidget != null && !craftingWidget.isHidden()) {
+            return true;
+        }
+        
+        return false;
+    }
+
+    // Helper method to check if player has crafting materials
+    private boolean hasCraftingMaterials() {
+        ItemContainer inv = client.getItemContainer(InventoryID.INVENTORY);
+        if (inv == null) return false;
+        
+        for (Item item : inv.getItems()) {
+            if (item.getId() == 1607 || item.getId() == 2357) { // Sapphire or Gold bar
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Track sapphire ring widget in crafting interface
+    private Map<String, Object> getSapphireRingWidgetInfo() {
+        Map<String, Object> widgetInfo = new HashMap<>();
+        
+        Widget sapphireRingWidget = client.getWidget(29229065);
+        if (sapphireRingWidget != null && !sapphireRingWidget.isHidden()) {
+            widgetInfo.put("exists", true);
+            widgetInfo.put("canvas_x", sapphireRingWidget.getCanvasLocation().getX());
+            widgetInfo.put("canvas_y", sapphireRingWidget.getCanvasLocation().getY());
+        } else {
+            widgetInfo.put("exists", false);
+            widgetInfo.put("canvas_x", -1);
+            widgetInfo.put("canvas_y", -1);
+        }
+        
+        return widgetInfo;
+    }
+
+    // Track crafting interface widget
+    private Map<String, Object> getCraftingInterfaceWidgetInfo() {
+        Map<String, Object> widgetInfo = new HashMap<>();
+        
+        // Use the same widget ID that's checked in isCraftingInterfaceOpen()
+        Widget craftingInterfaceWidget = client.getWidget(29229056);
+        if (craftingInterfaceWidget != null && !craftingInterfaceWidget.isHidden()) {
+            widgetInfo.put("exists", true);
+            widgetInfo.put("canvas_x", craftingInterfaceWidget.getCanvasLocation().getX());
+            widgetInfo.put("canvas_y", craftingInterfaceWidget.getCanvasLocation().getY());
+        } else {
+            widgetInfo.put("exists", false);
+            widgetInfo.put("canvas_x", -1);
+            widgetInfo.put("canvas_y", -1);
+        }
+        
+        return widgetInfo;
+    }
+
+    // Track bank item positions for key materials
+    private Map<String, Object> getBankItemPositions() {
+        Map<String, Object> bankPositions = new HashMap<>();
+        
+        // Define item IDs for key materials
+        int[] sapphireIds = {1607}; // Sapphire
+        int[] goldBarIds = {2357}; // Gold bar
+        int[] ringIds = {1637}; // Sapphire ring
+        int[] mouldIds = {1592}; // Ring mould
+        
+        // Track positions for each material type
+        bankPositions.put("sapphires", findBankItemPositions(sapphireIds));
+        bankPositions.put("gold_bars", findBankItemPositions(goldBarIds));
+        bankPositions.put("rings", findBankItemPositions(ringIds));
+        bankPositions.put("moulds", findBankItemPositions(mouldIds));
+        
+        return bankPositions;
+    }
+
+    // Helper method to find bank item positions
+    private List<Map<String, Object>> findBankItemPositions(int[] itemIds) {
+        List<Map<String, Object>> positions = new ArrayList<>();
+        
+        if (!isBankOpen()) {
+            return positions;
+        }
+        
+        ItemContainer bankContainer = client.getItemContainer(InventoryID.BANK);
+        if (bankContainer == null) {
+            return positions;
+        }
+        
+        // Get the bank item container widget (Bankmain.ITEMS)
+        Widget bankItemContainer = client.getWidget(WidgetInfo.BANK_ITEM_CONTAINER);
+        if (bankItemContainer == null) {
+            log.debug("Bank item container widget (Bankmain.ITEMS) not found");
+            return positions;
+        }
+        
+        log.debug("Bank container has {} slots, bank item container widget found", bankContainer.size());
+        
+        // Get all child widgets from the bank item container
+        Widget[] children = bankItemContainer.getChildren();
+        if (children == null) {
+            log.debug("Bank item container has no children");
+            return positions;
+        }
+        
+        log.debug("Bank item container has {} child widgets", children.length);
+        
+        // Iterate through all bank slots to find our target items
+        for (int slot = 0; slot < bankContainer.size(); slot++) {
+            Item item = bankContainer.getItem(slot);
+            if (item == null || item.getId() == -1) {
+                continue; // Skip empty slots
+            }
+            
+            // Check if this item is one we're looking for
+            for (int targetId : itemIds) {
+                if (item.getId() == targetId) {
+                    Map<String, Object> itemPos = new HashMap<>();
+                    itemPos.put("id", item.getId());
+                    itemPos.put("quantity", item.getQuantity());
+                    itemPos.put("slot", slot);
+                    
+                    // Get the specific item widget for this slot
+                    if (slot < children.length) {
+                        Widget itemWidget = children[slot];
+                        if (itemWidget != null && !itemWidget.isHidden()) {
+                            // Use the widget's CanvasLocation directly
+                            int canvasX = itemWidget.getCanvasLocation().getX();
+                            int canvasY = itemWidget.getCanvasLocation().getY();
+                            itemPos.put("canvas_x", canvasX);
+                            itemPos.put("canvas_y", canvasY);
+                            
+                            log.debug("Found item {} (qty: {}) at slot {} with canvas position ({}, {})", 
+                                item.getId(), item.getQuantity(), slot, canvasX, canvasY);
+                        } else {
+                            itemPos.put("canvas_x", -1);
+                            itemPos.put("canvas_y", -1);
+                            log.debug("Item {} at slot {} has null or hidden widget", item.getId(), slot);
+                        }
+                    } else {
+                        itemPos.put("canvas_x", -1);
+                        itemPos.put("canvas_y", -1);
+                        log.debug("Item {} at slot {} is beyond widget array bounds (slot: {}, children: {})", 
+                            item.getId(), slot, slot, children.length);
+                    }
+                    
+                    positions.add(itemPos);
+                    break;
+                }
+            }
+        }
+        
+        log.debug("Found {} items with positions for target IDs: {}", positions.size(), Arrays.toString(itemIds));
+        return positions;
+    }
+
+    // Update phase context and track transitions
+    private void updatePhaseContext() {
+        if (!currentPhase.equals(previousPhase)) {
+            // Phase changed - reset counters
+            previousPhase = currentPhase;
+            phaseStartTime = System.currentTimeMillis();
+            gamestateCountInPhase = 0;
+        } else {
+            // Same phase - increment counter
+            gamestateCountInPhase++;
+        }
+    }
+
     @Subscribe
     public void onGameTick(GameTick event) {
         Map<String, Object> state = new HashMap<>();
@@ -189,6 +410,10 @@ public class StateExporterPlugin extends Plugin {
         String timestampStr = String.valueOf(timestamp);
         state.put("timestamp", timestamp);
         state.put("world", client.getWorld());
+        
+        // Phase detection and context
+        currentPhase = detectCurrentPhase();
+        updatePhaseContext();
         
         // Player info (Enhanced with animation names and movement tracking)
             Player player = client.getLocalPlayer();
@@ -331,22 +556,27 @@ public class StateExporterPlugin extends Plugin {
         if (bankOpen) {
             ItemContainer bankContainer = client.getItemContainer(InventoryID.BANK);
             if (bankContainer != null) {
-                for (Item item : bankContainer.getItems()) {
-                Map<String, Object> itemMap = new HashMap<>();
-                itemMap.put("id", item.getId());
-                itemMap.put("quantity", item.getQuantity());
-                    
-                    // Get item name from RuneLite client
-                    ItemComposition itemComp = itemManager.getItemComposition(item.getId());
-                    if (itemComp != null) {
-                        itemMap.put("name", itemComp.getName());
-                        itemMap.put("members", itemComp.isMembers());
-                    } else {
-                        itemMap.put("name", "Unknown Item");
-                        itemMap.put("members", false);
+                // Iterate through all bank slots to capture items with their slot positions
+                for (int slot = 0; slot < bankContainer.size(); slot++) {
+                    Item item = bankContainer.getItem(slot);
+                    if (item != null && item.getId() != -1) {
+                        Map<String, Object> itemMap = new HashMap<>();
+                        itemMap.put("id", item.getId());
+                        itemMap.put("quantity", item.getQuantity());
+                        itemMap.put("slot", slot); // Add slot information
+                        
+                        // Get item name from RuneLite client
+                        ItemComposition itemComp = itemManager.getItemComposition(item.getId());
+                        if (itemComp != null) {
+                            itemMap.put("name", itemComp.getName());
+                            itemMap.put("members", itemComp.isMembers());
+                        } else {
+                            itemMap.put("name", "Unknown Item");
+                            itemMap.put("members", false);
+                        }
+                        
+                        bankItems.add(itemMap);
                     }
-                    
-                    bankItems.add(itemMap);
                 }
             }
         }
@@ -506,7 +736,13 @@ public class StateExporterPlugin extends Plugin {
         
         // Tabs (13 features) - All tabs active/inactive
             Map<String, Object> tabs = new HashMap<>();
-            tabs.put("currentTab", client.getVar(net.runelite.api.VarClientInt.INVENTORY_TAB));
+            // Get the currently active interface tab using TOPLEVEL_PANEL
+            int currentTab = client.getVarcIntValue(net.runelite.api.gameval.VarClientID.TOPLEVEL_PANEL);
+            tabs.put("currentTab", currentTab);
+            
+            // Add tab name mapping for better readability
+            String tabName = getTabName(currentTab);
+            tabs.put("currentTabName", tabName);
         
             // Inventory tab details
             ItemContainer invContainer = client.getItemContainer(InventoryID.INVENTORY);
@@ -602,6 +838,30 @@ public class StateExporterPlugin extends Plugin {
             state.put("last_movement", lastMovement);
         }
         
+        // Add phase context for temporal and sequential learning
+        Map<String, Object> phaseContext = new HashMap<>();
+        phaseContext.put("cycle_phase", currentPhase);
+        phaseContext.put("phase_start_time", phaseStartTime);
+        phaseContext.put("phase_duration_ms", System.currentTimeMillis() - phaseStartTime);
+        phaseContext.put("gamestates_in_phase", gamestateCountInPhase);
+        phaseContext.put("crafting_active", isCraftingActive);
+        state.put("phase_context", phaseContext);
+        
+        // Add widget tracking for crafting interface
+        Map<String, Object> sapphireRingWidget = getSapphireRingWidgetInfo();
+        state.put("sapphire_ring_widget", sapphireRingWidget);
+        
+        // Add crafting interface widget tracking
+        Map<String, Object> craftingInterfaceWidget = getCraftingInterfaceWidgetInfo();
+        state.put("crafting_interface_widget", craftingInterfaceWidget);
+        
+        // Add bank item position tracking
+        Map<String, Object> bankItemPositions = getBankItemPositions();
+        state.put("bank_item_positions", bankItemPositions);
+        
+        // Add bank close button tracking
+        Map<String, Object> bankCloseButton = getBankCloseButtonInfo();
+        state.put("bank_close_button", bankCloseButton);
         
         
         // Always update main runelite_gamestate.json
@@ -696,6 +956,7 @@ public class StateExporterPlugin extends Plugin {
             case 819: return "running";
             case 165: return "smelting";
             case 164: return "crafting";
+            case 899: return "crafting";
             case 1249: return "banking";
             case 832: return "fishing";
             case 883: return "woodcutting";
@@ -743,4 +1004,128 @@ public class StateExporterPlugin extends Plugin {
      * Captures everything under the mouse cursor
      */
 
+    // Helper method to find bank close button widget
+    private Map<String, Object> getBankCloseButtonInfo() {
+        Map<String, Object> closeButtonInfo = new HashMap<>();
+        
+        if (!isBankOpen()) {
+            closeButtonInfo.put("exists", false);
+            closeButtonInfo.put("canvas_x", -1);
+            closeButtonInfo.put("canvas_y", -1);
+            return closeButtonInfo;
+        }
+        
+        // Try to find the close button in common locations
+        Widget closeButton = null;
+        
+        // Method 1: Check Bankmain.CLOSE_BUTTON if it exists
+        try {
+            closeButton = client.getWidget(12, 13); // Bankmain.CLOSE_BUTTON (if exists)
+            if (closeButton != null && !closeButton.isHidden()) {
+                log.debug("Found bank close button at Bankmain.CLOSE_BUTTON");
+            }
+        } catch (Exception e) {
+            // Widget doesn't exist
+        }
+        
+        // Method 2: Check the main bank interface for close button
+        if (closeButton == null) {
+            Widget bankMain = client.getWidget(WidgetInfo.BANK_CONTAINER);
+            if (bankMain != null) {
+                Widget[] children = bankMain.getChildren();
+                if (children != null) {
+                    // Look for widgets that might be the close button
+                    for (int i = 0; i < children.length; i++) {
+                        Widget child = children[i];
+                        if (child != null && !child.isHidden()) {
+                            // Check if this widget is in the top-right area
+                            int x = child.getCanvasLocation().getX();
+                            int y = child.getCanvasLocation().getY();
+                            
+                            // Log all widgets in the bank interface for debugging
+                            log.debug("Bank widget {}: x={}, y={}, text='{}', actions={}", 
+                                i, x, y, child.getText(), Arrays.toString(child.getActions()));
+                            
+                            // The close button is usually in the top-right area
+                            // and might have actions like "Close" or "X"
+                            if (child.getActions() != null) {
+                                for (String action : child.getActions()) {
+                                    if (action != null && (action.contains("Close") || action.contains("X"))) {
+                                        closeButton = child;
+                                        log.debug("Found potential close button at index {} with action: {}", i, action);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Method 3: Check common close button widget IDs
+        if (closeButton == null) {
+            int[] commonCloseButtonIds = {164, 548, 12, 13, 14, 15};
+            for (int id : commonCloseButtonIds) {
+                try {
+                    Widget widget = client.getWidget(12, id); // Bankmain group
+                    if (widget != null && !widget.isHidden()) {
+                        log.debug("Found widget at Bankmain.{} with actions: {}", id, Arrays.toString(widget.getActions()));
+                        if (widget.getActions() != null) {
+                            for (String action : widget.getActions()) {
+                                if (action != null && (action.contains("Close") || action.contains("X"))) {
+                                    closeButton = widget;
+                                    log.debug("Found close button at Bankmain.{}", id);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    // Widget doesn't exist
+                }
+            }
+        }
+        
+        if (closeButton != null) {
+            closeButtonInfo.put("exists", true);
+            closeButtonInfo.put("canvas_x", closeButton.getCanvasLocation().getX());
+            closeButtonInfo.put("canvas_y", closeButton.getCanvasLocation().getY());
+            closeButtonInfo.put("widget_id", closeButton.getId());
+            closeButtonInfo.put("actions", closeButton.getActions());
+            log.debug("Bank close button found at ({}, {}) with actions: {}", 
+                closeButton.getCanvasLocation().getX(), closeButton.getCanvasLocation().getY(), 
+                Arrays.toString(closeButton.getActions()));
+        } else {
+            closeButtonInfo.put("exists", false);
+            closeButtonInfo.put("canvas_x", -1);
+            closeButtonInfo.put("canvas_y", -1);
+            log.debug("Bank close button not found");
+        }
+        
+        return closeButtonInfo;
+    }
+    
+    /**
+     * Get human-readable tab name from tab ID
+     */
+    private String getTabName(int tabId) {
+        switch (tabId) {
+            case 0: return "combat";
+            case 1: return "stats";
+            case 2: return "quests";
+            case 3: return "inventory";
+            case 4: return "equipment";
+            case 5: return "prayer";
+            case 6: return "magic";
+            case 7: return "clan";
+            case 8: return "friends";
+            case 9: return "ignores";
+            case 10: return "settings";
+            case 11: return "emotes";
+            case 12: return "music";
+            case 13: return "logout";
+            default: return "unknown_tab_" + tabId;
+        }
+    }
 } 
