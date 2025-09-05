@@ -21,11 +21,14 @@ import javax.inject.Inject;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.util.*;
+import java.util.LinkedHashMap;
 import java.awt.AWTException;
 import java.awt.Rectangle;
 import java.awt.Robot;
+import java.awt.Point;
 import java.awt.image.BufferedImage;
 import javax.imageio.ImageIO;
+import javax.annotation.Nonnull;
 
 @Slf4j
 @PluginDescriptor(
@@ -95,6 +98,11 @@ public class StateExporterPlugin extends Plugin {
             interaction.put("action", event.getMenuOption());
             interaction.put("target", event.getMenuTarget());
             interaction.put("timestamp", System.currentTimeMillis());
+            
+            // Capture menu action details
+            interaction.put("menu_action", event.getMenuAction().name());
+            // Note: MenuOptionClicked doesn't have getMenuId, getMenuParam0, getMenuParam1
+            // These are only available in MenuEntry, not in the event
             
             // Always try to parse item information from target
             if (event.getMenuTarget().contains(">")) {
@@ -187,6 +195,46 @@ public class StateExporterPlugin extends Plugin {
             // Store the enhanced interaction
             lastInteraction = interaction;
         }
+    }
+    
+    /**
+     * Track menu actions for analysis
+     */
+    private Map<String, Object> getMenuActionInfo() {
+        Map<String, Object> menuInfo = new HashMap<>();
+        
+        if (lastInteraction != null) {
+            menuInfo.put("last_action", lastInteraction.get("action"));
+            menuInfo.put("last_target", lastInteraction.get("target"));
+            menuInfo.put("last_timestamp", lastInteraction.get("timestamp"));
+            menuInfo.put("menu_action", lastInteraction.get("menu_action"));
+            menuInfo.put("menu_id", lastInteraction.get("menu_id"));
+            menuInfo.put("menu_param0", lastInteraction.get("menu_param0"));
+            menuInfo.put("menu_param1", lastInteraction.get("menu_param1"));
+            
+            // Add interaction type if available
+            if (lastInteraction.containsKey("type")) {
+                menuInfo.put("interaction_type", lastInteraction.get("type"));
+            }
+            
+            // Add source/destination for bank interactions
+            if (lastInteraction.containsKey("source")) {
+                menuInfo.put("source", lastInteraction.get("source"));
+                menuInfo.put("destination", lastInteraction.get("destination"));
+            }
+            
+            // Add movement details if available
+            if (lastInteraction.containsKey("destination_x")) {
+                menuInfo.put("destination_x", lastInteraction.get("destination_x"));
+                menuInfo.put("destination_y", lastInteraction.get("destination_y"));
+            }
+        } else {
+            menuInfo.put("last_action", null);
+            menuInfo.put("last_target", null);
+            menuInfo.put("last_timestamp", null);
+        }
+        
+        return menuInfo;
     }
 
     // Phase detection method
@@ -479,6 +527,10 @@ public class StateExporterPlugin extends Plugin {
         state.put("camera_z", cameraZ);
         state.put("camera_pitch", cameraPitch);
         state.put("camera_yaw", cameraYaw);
+        
+        // Camera scale capture using the correct getScale() method
+        int cameraScale = client.getScale();
+        state.put("camera_scale", cameraScale);
         
         // Inventory (Enhanced with item names) - 28 slots × 2 (id, quantity) + names
             ItemContainer inv = client.getItemContainer(InventoryID.INVENTORY);
@@ -838,6 +890,10 @@ public class StateExporterPlugin extends Plugin {
             state.put("last_movement", lastMovement);
         }
         
+        // Add menu action tracking
+        Map<String, Object> menuActionInfo = getMenuActionInfo();
+        state.put("menu_actions", menuActionInfo);
+        
         // Add phase context for temporal and sequential learning
         Map<String, Object> phaseContext = new HashMap<>();
         phaseContext.put("cycle_phase", currentPhase);
@@ -863,74 +919,158 @@ public class StateExporterPlugin extends Plugin {
         Map<String, Object> bankCloseButton = getBankCloseButtonInfo();
         state.put("bank_close_button", bankCloseButton);
         
+        // Add ID mappings for standardization
+        Map<String, Object> idMappings = createIdMappings();
+        state.put("id_mappings", idMappings);
         
+        // Add new enhanced features
+        Map<String, Object> mouseInfo = getMouseCursorInfo();
+        state.put("mouse_cursor", mouseInfo);
+        
+        Map<String, Object> selectedTile = getSelectedSceneTile();
+        state.put("selected_tile", selectedTile);
+        
+        List<Map<String, Object>> closestStructures = getClosestStructures();
+        state.put("closest_structures", closestStructures);
+        
+        // Enhanced item information with composition data
+        if (inv != null) {
+            Item[] items = inv.getItems();
+            for (int i = 0; i < items.length; i++) {
+                Item item = items[i];
+                if (item != null && item.getId() != -1) {
+                    Map<String, Object> itemMap = new HashMap<>();
+                    itemMap.put("id", item.getId());
+                    itemMap.put("quantity", item.getQuantity());
+                    Map<String, Object> itemComp = getItemComposition(item.getId());
+                    itemMap.putAll(itemComp);
+                    // Update the inventory list
+                    if (i < ((List<Map<String, Object>>) state.get("inventory")).size()) {
+                        ((List<Map<String, Object>>) state.get("inventory")).set(i, itemMap);
+                    }
+                }
+            }
+        }
+        
+        // Enhanced bank items with composition data
+        if (bankOpen && !bankItems.isEmpty()) {
+            for (Map<String, Object> itemMap : bankItems) {
+                int itemId = (Integer) itemMap.get("id");
+                Map<String, Object> itemComp = getItemComposition(itemId);
+                itemMap.putAll(itemComp);
+            }
+        }
+        
+        // Enhanced game objects with composition data
+        if (!objects.isEmpty()) {
+            for (Map<String, Object> objMap : objects) {
+                int objId = (Integer) objMap.get("id");
+                Map<String, Object> objComp = getObjectComposition(objId);
+                objMap.putAll(objComp);
+            }
+        }
+        
+        // Enhanced NPCs with composition data
+        if (!npcs.isEmpty()) {
+            for (Map<String, Object> npcMap : npcs) {
+                int npcId = (Integer) npcMap.get("id");
+                Map<String, Object> npcComp = getNpcComposition(npcId);
+                npcMap.putAll(npcComp);
+            }
+        }
+        
+        // Standardize the gamestate structure
+        Map<String, Object> standardizedState = standardizeGamestate(state);
+        
+        // Bot mode logic: different behavior for training vs live operation
+        if (config.botMode() == BotMode.NONE) {
+            // NORMAL MODE: Save to training data directories
+            saveTrainingGamestate(standardizedState, timestampStr);
+        } else {
+            // BOT MODE: Save to rolling buffer in bot directory
+            saveBotGamestate(standardizedState, timestampStr);
+        }
+    }
+
+    /**
+     * Save gamestate to training data directories (normal mode)
+     */
+    private void saveTrainingGamestate(Map<String, Object> state, String timestampStr) {
         // Always update main runelite_gamestate.json
         String mainJsonFilename = config.outputPath();
         try (FileWriter writer = new FileWriter(mainJsonFilename)) {
             gson.toJson(state, writer);
+            log.debug("Main gamestate updated: {}", mainJsonFilename);
         } catch (IOException e) {
-            log.error("Failed to write main game state", e);
+            log.error("Failed to write main game state to {}: {}", mainJsonFilename, e.getMessage());
         }
         
         // Only save screenshots and per-tick JSONs if data saving is enabled
         if (config.enableDataSaving()) {
-            try {
-                Robot robot = new Robot();
-                
-                // Check if client is properly loaded
-                if (client.getCanvas() == null) {
-                    log.warn("Client canvas is null - client may not be fully loaded");
-                    state.put("screenshot", "NO_CANVAS");
-                    return;
+            // Only capture screenshots if screenshots are enabled
+            if (config.enableScreenshots()) {
+                try {
+                    Robot robot = new Robot();
+                    
+                    // Check if client is properly loaded
+                    if (client.getCanvas() == null) {
+                        log.warn("Client canvas is null - client may not be fully loaded");
+                        state.put("screenshot", "NO_CANVAS");
+                        return;
+                    }
+                    
+                    log.debug("Client canvas found - bounds: {}x{}, location: ({}, {})", 
+                        client.getCanvas().getWidth(), client.getCanvas().getHeight(),
+                        client.getCanvas().getX(), client.getCanvas().getY());
+                    
+                    // Get the RuneScape client window bounds
+                    java.awt.Rectangle clientBounds = client.getCanvas().getBounds();
+                    java.awt.Point clientLocation = client.getCanvas().getLocationOnScreen();
+                    
+                    // Validate client bounds
+                    if (clientBounds.width <= 0 || clientBounds.height <= 0) {
+                        log.warn("Invalid client bounds: {}x{}", clientBounds.width, clientBounds.height);
+                        state.put("screenshot", "INVALID_BOUNDS");
+                        return;
+                    }
+                    
+                    // Check if client window is visible and not minimized
+                    if (clientLocation.x < 0 || clientLocation.y < 0) {
+                        log.warn("Client window appears to be off-screen or minimized: ({}, {})", clientLocation.x, clientLocation.y);
+                        state.put("screenshot", "OFF_SCREEN");
+                        return;
+                    }
+                    
+                    // Create a rectangle for just the client window
+                    Rectangle clientRect = new Rectangle(
+                        clientLocation.x, 
+                        clientLocation.y, 
+                        clientBounds.width, 
+                        clientBounds.height
+                    );
+                    
+                    // Capture only the client window area
+                    BufferedImage clientImage = robot.createScreenCapture(clientRect);
+                    
+                    java.io.File dir = new java.io.File(config.screenshotDir());
+                    if (!dir.exists()) dir.mkdirs();
+                    java.io.File screenshotFile = new java.io.File(dir, timestampStr + ".png");
+                    ImageIO.write(clientImage, "png", screenshotFile);
+                    state.put("screenshot", timestampStr + ".png");
+                    
+                    log.debug("Screenshot saved: {}x{} pixels at ({}, {})", 
+                        clientRect.width, clientRect.height, clientLocation.x, clientLocation.y);
+                } catch (AWTException | IOException e) {
+                    log.error("Failed to capture screenshot", e);
+                    state.put("screenshot", "ERROR");
+                } catch (Exception e) {
+                    log.error("Unexpected error during screenshot capture", e);
+                    state.put("screenshot", "ERROR");
                 }
-                
-                log.debug("Client canvas found - bounds: {}x{}, location: ({}, {})", 
-                    client.getCanvas().getWidth(), client.getCanvas().getHeight(),
-                    client.getCanvas().getX(), client.getCanvas().getY());
-                
-                // Get the RuneScape client window bounds
-                java.awt.Rectangle clientBounds = client.getCanvas().getBounds();
-                java.awt.Point clientLocation = client.getCanvas().getLocationOnScreen();
-                
-                // Validate client bounds
-                if (clientBounds.width <= 0 || clientBounds.height <= 0) {
-                    log.warn("Invalid client bounds: {}x{}", clientBounds.width, clientBounds.height);
-                    state.put("screenshot", "INVALID_BOUNDS");
-                    return;
-                }
-                
-                // Check if client window is visible and not minimized
-                if (clientLocation.x < 0 || clientLocation.y < 0) {
-                    log.warn("Client window appears to be off-screen or minimized: ({}, {})", clientLocation.x, clientLocation.y);
-                    state.put("screenshot", "OFF_SCREEN");
-                    return;
-                }
-                
-                // Create a rectangle for just the client window
-                Rectangle clientRect = new Rectangle(
-                    clientLocation.x, 
-                    clientLocation.y, 
-                    clientBounds.width, 
-                    clientBounds.height
-                );
-                
-                // Capture only the client window area
-                BufferedImage clientImage = robot.createScreenCapture(clientRect);
-                
-                java.io.File dir = new java.io.File(config.screenshotDir());
-                if (!dir.exists()) dir.mkdirs();
-                java.io.File screenshotFile = new java.io.File(dir, timestampStr + ".png");
-                ImageIO.write(clientImage, "png", screenshotFile);
-                state.put("screenshot", timestampStr + ".png");
-                
-                log.debug("Screenshot saved: {}x{} pixels at ({}, {})", 
-                    clientRect.width, clientRect.height, clientLocation.x, clientLocation.y);
-            } catch (AWTException | IOException e) {
-                log.error("Failed to capture screenshot", e);
-                state.put("screenshot", "ERROR");
-            } catch (Exception e) {
-                log.error("Unexpected error during screenshot capture", e);
-                state.put("screenshot", "ERROR");
+            } else {
+                // Screenshots disabled - just log it
+                state.put("screenshot", "DISABLED");
+                log.debug("Screenshots disabled in plugin configuration");
             }
             
             // Always save per-tick JSON
@@ -943,6 +1083,86 @@ public class StateExporterPlugin extends Plugin {
             } catch (IOException e) {
                 log.error("Failed to write per-tick game state", e);
             }
+        }
+    }
+
+    /**
+     * Save gamestate to bot directory with rolling buffer (bot mode)
+     */
+    private void saveBotGamestate(Map<String, Object> state, String timestampStr) {
+        try {
+            String botDataPath = config.botMode().getDataPath();
+            log.debug("Bot mode {} active - using data path: {}", config.botMode().getDisplayName(), botDataPath);
+            
+            java.io.File botDir = new java.io.File(botDataPath);
+            if (!botDir.exists()) {
+                boolean created = botDir.mkdirs();
+                if (!created) {
+                    log.error("Failed to create bot directory: {}", botDataPath);
+                    return;
+                }
+                log.debug("Created bot directory: {}", botDataPath);
+            }
+            
+            // Create gamestates subdirectory
+            java.io.File gamestatesDir = new java.io.File(botDataPath + "/gamestates");
+            if (!gamestatesDir.exists()) {
+                boolean created = gamestatesDir.mkdirs();
+                if (!created) {
+                    log.error("Failed to create gamestates directory: {}", gamestatesDir.getPath());
+                    return;
+                }
+                log.debug("Created gamestates directory: {}", gamestatesDir.getPath());
+            }
+            
+            // Save current gamestate with timestamp
+            String gamestateFile = gamestatesDir.getPath() + "/" + timestampStr + ".json";
+            try (FileWriter writer = new FileWriter(gamestateFile)) {
+                gson.toJson(state, writer);
+                log.debug("Bot gamestate saved: {}", gamestateFile);
+            }
+            
+            // Enforce rolling buffer: keep only last 20 files
+            enforceRollingBuffer(gamestatesDir, 20);
+            
+            // Set screenshot status for bot mode (no screenshots)
+            state.put("screenshot", "BOT_MODE_NO_SCREENSHOTS");
+            
+        } catch (IOException e) {
+            log.error("Failed to write bot gamestate: {}", e.getMessage());
+        } catch (Exception e) {
+            log.error("Unexpected error in bot mode: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Enforce rolling buffer by keeping only the N most recent files
+     */
+    private void enforceRollingBuffer(java.io.File directory, int maxFiles) {
+        try {
+            java.io.File[] files = directory.listFiles((dir, name) -> name.endsWith(".json"));
+            if (files == null || files.length <= maxFiles) {
+                return; // No cleanup needed
+            }
+            
+            // Sort files by last modified time (oldest first)
+            java.util.Arrays.sort(files, (f1, f2) -> Long.compare(f1.lastModified(), f2.lastModified()));
+            
+            // Delete oldest files beyond the limit
+            int filesToDelete = files.length - maxFiles;
+            for (int i = 0; i < filesToDelete; i++) {
+                boolean deleted = files[i].delete();
+                if (deleted) {
+                    log.debug("Deleted old gamestate file: {}", files[i].getName());
+                } else {
+                    log.warn("Failed to delete old gamestate file: {}", files[i].getName());
+                }
+            }
+            
+            log.debug("Rolling buffer cleanup: deleted {} old files, keeping {} most recent", filesToDelete, maxFiles);
+            
+        } catch (Exception e) {
+            log.error("Error during rolling buffer cleanup: {}", e.getMessage());
         }
     }
 
@@ -1128,4 +1348,388 @@ public class StateExporterPlugin extends Plugin {
             default: return "unknown_tab_" + tabId;
         }
     }
+    
+    /**
+     * Get mouse canvas position
+     */
+    private net.runelite.api.Point getMouseCanvasPosition() {
+        try {
+            return client.getMouseCanvasPosition();
+        } catch (Exception e) {
+            log.debug("Failed to get mouse canvas position: {}", e.getMessage());
+            return new net.runelite.api.Point(-1, -1);
+        }
+    }
+    
+    /**
+     * Get item composition information
+     */
+    private Map<String, Object> getItemComposition(int itemId) {
+        Map<String, Object> itemInfo = new HashMap<>();
+        try {
+            @Nonnull ItemComposition itemComp = client.getItemDefinition(itemId);
+            itemInfo.put("id", itemId);
+            itemInfo.put("name", itemComp.getName());
+            itemInfo.put("members", itemComp.isMembers());
+            itemInfo.put("tradeable", itemComp.isTradeable());
+            itemInfo.put("stackable", itemComp.isStackable());
+            // Note: Some methods may not exist in the current RuneLite API version
+            // itemInfo.put("noted", itemComp.isNoted());
+            // itemInfo.put("placeholder", itemComp.isPlaceholder());
+            // itemInfo.put("equipable", itemComp.isEquipable());
+            // itemInfo.put("equipment_slot", itemComp.getEquipmentSlot());
+            // itemInfo.put("actions", Arrays.asList(itemComp.getActions()));
+        } catch (Exception e) {
+            log.debug("Failed to get item composition for ID {}: {}", itemId, e.getMessage());
+            itemInfo.put("id", itemId);
+            itemInfo.put("name", "Unknown Item");
+            itemInfo.put("error", e.getMessage());
+        }
+        return itemInfo;
+    }
+    
+    /**
+     * Get object composition information
+     */
+    private Map<String, Object> getObjectComposition(int objectId) {
+        Map<String, Object> objInfo = new HashMap<>();
+        try {
+            ObjectComposition objComp = client.getObjectDefinition(objectId);
+            objInfo.put("id", objectId);
+            objInfo.put("name", objComp.getName());
+            objInfo.put("actions", Arrays.asList(objComp.getActions()));
+            // Note: Some methods may not exist in the current RuneLite API version
+            // objInfo.put("map_actions", Arrays.asList(objComp.getMapActions()));
+            // objInfo.put("size_x", objComp.getSizeX());
+            // objInfo.put("size_y", objComp.getSizeY());
+            // objInfo.put("interactable", objComp.isInteractable());
+        } catch (Exception e) {
+            log.debug("Failed to get object composition for ID {}: {}", objectId, e.getMessage());
+            objInfo.put("id", objectId);
+            objInfo.put("name", "Unknown Object");
+            objInfo.put("error", e.getMessage());
+        }
+        return objInfo;
+    }
+    
+    /**
+     * Get NPC composition information
+     */
+    private Map<String, Object> getNpcComposition(int npcId) {
+        Map<String, Object> npcInfo = new HashMap<>();
+        try {
+            NPCComposition npcComp = client.getNpcDefinition(npcId);
+            npcInfo.put("id", npcId);
+            npcInfo.put("name", npcComp.getName());
+            npcInfo.put("actions", Arrays.asList(npcComp.getActions()));
+            npcInfo.put("combat_level", npcComp.getCombatLevel());
+            npcInfo.put("size", npcComp.getSize());
+            // Note: Some methods may not exist in the current RuneLite API version
+            // npcInfo.put("interactable", npcComp.isInteractable());
+        } catch (Exception e) {
+            log.debug("Failed to get NPC composition for ID {}: {}", npcId, e.getMessage());
+            npcInfo.put("id", npcId);
+            npcInfo.put("name", "Unknown NPC");
+            npcInfo.put("error", e.getMessage());
+        }
+        return npcInfo;
+    }
+    
+    /**
+     * Get struct composition information
+     */
+    private Map<String, Object> getStructComposition(int structId) {
+        Map<String, Object> structInfo = new HashMap<>();
+        try {
+            StructComposition structComp = client.getStructComposition(structId);
+            structInfo.put("id", structId);
+            // Note: Some methods may not exist in the current RuneLite API version
+            // structInfo.put("name", structComp.getName());
+            // structInfo.put("actions", Arrays.asList(structComp.getActions()));
+            // structInfo.put("size_x", structComp.getSizeX());
+            // structInfo.put("size_y", structComp.getSizeY());
+        } catch (Exception e) {
+            log.debug("Failed to get struct composition for ID {}: {}", structId, e.getMessage());
+            structInfo.put("id", structId);
+            structInfo.put("name", "Unknown Struct");
+            structInfo.put("error", e.getMessage());
+        }
+        return structInfo;
+    }
+    
+    /**
+     * Get closest structures to player
+     */
+    private List<Map<String, Object>> getClosestStructures() {
+        List<Map<String, Object>> structures = new ArrayList<>();
+        Player player = client.getLocalPlayer();
+        if (player == null) return structures;
+        
+        int playerX = player.getWorldLocation().getX();
+        int playerY = player.getWorldLocation().getY();
+        
+        Scene scene = client.getScene();
+        Tile[][][] tiles = scene.getTiles();
+        
+        for (int plane = 0; plane < tiles.length; plane++) {
+            for (int x = 0; x < tiles[plane].length; x++) {
+                for (int y = 0; y < tiles[plane][x].length; y++) {
+                    Tile tile = tiles[plane][x][y];
+                    if (tile == null) continue;
+                    
+                    for (GameObject obj : tile.getGameObjects()) {
+                        if (obj != null) {
+                            Map<String, Object> objInfo = getObjectComposition(obj.getId());
+                            objInfo.put("world_x", obj.getWorldLocation().getX());
+                            objInfo.put("world_y", obj.getWorldLocation().getY());
+                            objInfo.put("plane", obj.getWorldLocation().getPlane());
+                            
+                            // Calculate distance
+                            double distance = Math.sqrt(
+                                Math.pow(obj.getWorldLocation().getX() - playerX, 2) + 
+                                Math.pow(obj.getWorldLocation().getY() - playerY, 2)
+                            );
+                            objInfo.put("distance", distance);
+                            
+                            structures.add(objInfo);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Sort by distance and keep closest 10
+        structures.sort((a, b) -> Double.compare((Double) a.get("distance"), (Double) b.get("distance")));
+        if (structures.size() > 10) {
+            structures = structures.subList(0, 10);
+        }
+        
+        return structures;
+    }
+    
+    /**
+     * Check what's under the mouse cursor using clickbox
+     */
+    private Map<String, Object> getMouseCursorInfo() {
+        Map<String, Object> cursorInfo = new HashMap<>();
+        net.runelite.api.Point mousePos = getMouseCanvasPosition();
+        
+        if (mousePos.getX() == -1 || mousePos.getY() == -1) {
+            cursorInfo.put("valid", false);
+            return cursorInfo;
+        }
+        
+        cursorInfo.put("valid", true);
+        cursorInfo.put("canvas_x", mousePos.getX());
+        cursorInfo.put("canvas_y", mousePos.getY());
+        
+        // Try to get what's under the cursor
+        try {
+            // Note: getCanvasWorldPosition method may not exist in current RuneLite API
+            // For now, we'll just capture the canvas position
+            cursorInfo.put("world_position_available", false);
+            cursorInfo.put("world_position_error", "getCanvasWorldPosition method not available");
+        } catch (Exception e) {
+            log.debug("Failed to get world position under mouse: {}", e.getMessage());
+            cursorInfo.put("world_position_error", e.getMessage());
+        }
+        
+        return cursorInfo;
+    }
+    
+    /**
+     * Get selected scene tile (last right-clicked tile)
+     */
+    private Map<String, Object> getSelectedSceneTile() {
+        Map<String, Object> selectedTile = new HashMap<>();
+        try {
+            Tile tile = client.getSelectedSceneTile();
+            if (tile != null) {
+                selectedTile.put("exists", true);
+                selectedTile.put("world_x", tile.getWorldLocation().getX());
+                selectedTile.put("world_y", tile.getWorldLocation().getY());
+                selectedTile.put("plane", tile.getWorldLocation().getPlane());
+                
+                // Get objects on the selected tile
+                List<Map<String, Object>> objects = new ArrayList<>();
+                for (GameObject obj : tile.getGameObjects()) {
+                    if (obj != null) {
+                        Map<String, Object> objInfo = getObjectComposition(obj.getId());
+                        objInfo.put("world_x", obj.getWorldLocation().getX());
+                        objInfo.put("world_y", obj.getWorldLocation().getY());
+                        objects.add(objInfo);
+                    }
+                }
+                selectedTile.put("objects", objects);
+            } else {
+                selectedTile.put("exists", false);
+            }
+        } catch (Exception e) {
+            log.debug("Failed to get selected scene tile: {}", e.getMessage());
+            selectedTile.put("exists", false);
+            selectedTile.put("error", e.getMessage());
+        }
+        return selectedTile;
+    }
+    
+    /**
+     * Create ID mappings for standardization
+     */
+    private Map<String, Object> createIdMappings() {
+        Map<String, Object> idMappings = new HashMap<>();
+        
+        // Item ID mappings
+        Map<String, Object> itemMappings = new HashMap<>();
+        itemMappings.put("sapphire", 1607);
+        itemMappings.put("gold_bar", 2357);
+        itemMappings.put("sapphire_ring", 1637);
+        itemMappings.put("ring_mould", 1592);
+        idMappings.put("items", itemMappings);
+        
+        // Object ID mappings
+        Map<String, Object> objectMappings = new HashMap<>();
+        objectMappings.put("bank_booth", 11758);
+        objectMappings.put("furnace", 16469);
+        objectMappings.put("anvil", 2097);
+        idMappings.put("objects", objectMappings);
+        
+        // NPC ID mappings
+        Map<String, Object> npcMappings = new HashMap<>();
+        npcMappings.put("banker", 394);
+        npcMappings.put("assistant", 394);
+        idMappings.put("npcs", npcMappings);
+        
+        // Animation ID mappings
+        Map<String, Object> animationMappings = new HashMap<>();
+        animationMappings.put("idle", -1);
+        animationMappings.put("walking", 808);
+        animationMappings.put("running", 819);
+        animationMappings.put("crafting", 164);
+        animationMappings.put("smelting", 165);
+        animationMappings.put("banking", 1249);
+        idMappings.put("animations", animationMappings);
+        
+        return idMappings;
+    }
+    
+    /**
+     * Standardize gamestate structure for consistent feature organization
+     */
+    private Map<String, Object> standardizeGamestate(Map<String, Object> state) {
+        Map<String, Object> standardized = new LinkedHashMap<>();
+        
+        // Core game state (always present)
+        standardized.put("timestamp", state.get("timestamp"));
+        standardized.put("world", state.get("world"));
+        
+        // Player state
+        if (state.containsKey("player")) {
+            standardized.put("player", state.get("player"));
+        }
+        
+        // Camera and view
+        if (state.containsKey("camera_x")) {
+            Map<String, Object> camera = new HashMap<>();
+            camera.put("x", state.get("camera_x"));
+            camera.put("y", state.get("camera_y"));
+            camera.put("z", state.get("camera_z"));
+            camera.put("pitch", state.get("camera_pitch"));
+            camera.put("yaw", state.get("camera_yaw"));
+            camera.put("scale", state.get("camera_scale"));
+            standardized.put("camera", camera);
+        }
+        
+        // Inventory and bank
+        if (state.containsKey("inventory")) {
+            standardized.put("inventory", state.get("inventory"));
+        }
+        if (state.containsKey("bank_open")) {
+            standardized.put("bank_open", state.get("bank_open"));
+        }
+        if (state.containsKey("bank")) {
+            standardized.put("bank", state.get("bank"));
+        }
+        if (state.containsKey("bank_quantity")) {
+            standardized.put("bank_quantity", state.get("bank_quantity"));
+        }
+        
+        // Game world
+        if (state.containsKey("game_objects")) {
+            standardized.put("game_objects", state.get("game_objects"));
+        }
+        if (state.containsKey("bank_booths")) {
+            standardized.put("bank_booths", state.get("bank_booths"));
+        }
+        if (state.containsKey("furnaces")) {
+            standardized.put("furnaces", state.get("furnaces"));
+        }
+        if (state.containsKey("npcs")) {
+            standardized.put("npcs", state.get("npcs"));
+        }
+        if (state.containsKey("closest_structures")) {
+            standardized.put("closest_structures", state.get("closest_structures"));
+        }
+        
+        // UI and interaction
+        if (state.containsKey("minimap_world_info")) {
+            standardized.put("minimap", state.get("minimap_world_info"));
+        }
+        if (state.containsKey("skills")) {
+            standardized.put("skills", state.get("skills"));
+        }
+        if (state.containsKey("chatbox")) {
+            standardized.put("chatbox", state.get("chatbox"));
+        }
+        if (state.containsKey("tabs")) {
+            standardized.put("tabs", state.get("tabs"));
+        }
+        
+        // Mouse and interaction
+        if (state.containsKey("mouse_cursor")) {
+            standardized.put("mouse_cursor", state.get("mouse_cursor"));
+        }
+        if (state.containsKey("selected_tile")) {
+            standardized.put("selected_tile", state.get("selected_tile"));
+        }
+        if (state.containsKey("menu_actions")) {
+            standardized.put("menu_actions", state.get("menu_actions"));
+        }
+        if (state.containsKey("last_interaction")) {
+            standardized.put("last_interaction", state.get("last_interaction"));
+        }
+        if (state.containsKey("last_movement")) {
+            standardized.put("last_movement", state.get("last_movement"));
+        }
+        
+        // Context and state
+        if (state.containsKey("phase_context")) {
+            standardized.put("phase_context", state.get("phase_context"));
+        }
+        if (state.containsKey("sapphire_ring_widget")) {
+            standardized.put("sapphire_ring_widget", state.get("sapphire_ring_widget"));
+        }
+        if (state.containsKey("crafting_interface_widget")) {
+            standardized.put("crafting_interface_widget", state.get("crafting_interface_widget"));
+        }
+        if (state.containsKey("bank_item_positions")) {
+            standardized.put("bank_item_positions", state.get("bank_item_positions"));
+        }
+        if (state.containsKey("bank_close_button")) {
+            standardized.put("bank_close_button", state.get("bank_close_button"));
+        }
+        
+        // ID mappings
+        if (state.containsKey("id_mappings")) {
+            standardized.put("id_mappings", state.get("id_mappings"));
+        }
+        
+        // Screenshot info
+        if (state.containsKey("screenshot")) {
+            standardized.put("screenshot", state.get("screenshot"));
+        }
+        
+        return standardized;
+    }
+    
+
 } 

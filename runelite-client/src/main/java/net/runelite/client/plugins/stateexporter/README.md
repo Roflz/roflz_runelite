@@ -1,104 +1,125 @@
-# State Exporter Plugin - Optimized for Sapphire Ring Crafting
+# State Exporter Plugin
 
-## Overview
-This plugin has been optimized to collect only the essential game state information needed for training an imitation learning bot to craft sapphire rings in Old School RuneScape.
+A RuneLite plugin that exports comprehensive game state data for bot training and analysis.
 
-## Feature Extraction Summary
+## Features
 
-### **Total Features: ~150-200 (down from 500+)**
+### Player (15 features)
+- World coordinates (x, y, plane)
+- Health ratio
+- Animation ID and name
+- Movement status and direction
+- Run energy
+- Prayer points
+- Special attack percentage
+- Last action and target
+- Last interaction details
+- Last movement details
 
-#### **1. Player State (8 features)**
-- `world_x`, `world_y`, `plane` - Player position
-- `health` - Current health ratio
-- `animation` - Current animation ID
-- `run_energy` - Run energy percentage
-- `prayer` - Prayer points
-- `special_attack` - Special attack percentage
+### Camera (6 features)
+- Camera coordinates (x, y, z)
+- Camera pitch and yaw
+- Camera scale (zoom level)
 
-#### **2. Camera (5 features)**
-- `camera_x`, `camera_y`, `camera_z` - Camera position
-- `camera_pitch`, `camera_yaw` - Camera orientation
+### Inventory (28+ features)
+- Item IDs, quantities, and names
+- Item properties (members, tradeable, stackable, etc.)
+- Item actions and equipment slots
 
-#### **3. Inventory (56 features)**
-- 28 inventory slots × 2 (item ID + quantity)
-- Essential for tracking crafting materials (sapphires, gold bars, rings)
+### Bank (Variable features)
+- Bank open/closed status
+- Quantity selection mode (1, 5, 10, X, All)
+- Bank contents with item details
+- Item positions and canvas coordinates
 
-#### **4. Bank State (1 feature)**
-- `bank_open` - Boolean indicating if bank interface is open
+### Game Objects (Variable features)
+- Object IDs, names, and properties
+- World coordinates and distances
+- Object actions and interactivity
+- Special tracking for bank booths and furnaces
 
-#### **5. Bank Contents (Variable features)**
-- All bank items with ID and quantity
-- Critical for knowing available materials
+### NPCs (Variable features)
+- NPC IDs, names, and properties
+- World coordinates and distances
+- Combat levels and interactivity
+- Focus on bankers and important NPCs
 
-#### **6. Game Objects (Variable features)**
-- All visible game objects with:
-  - Object ID, name, position (x, y, plane)
-  - Distance from player (for prioritization)
-- Focuses on banks, furnaces, and crafting stations
+### Minimap (4 features)
+- Base coordinates
+- Map regions
+- Local player region
 
-#### **7. NPCs (Bankers only)**
-- Only banker NPCs within range
-- Position, health, and interaction state
-- Essential for banking operations
+### Skills (2 features)
+- Crafting level and experience
 
-#### **8. Minimap/World Info (4 features)**
-- `base_x`, `base_y` - World base coordinates
-- `map_regions` - Current map regions
-- `local_player_region` - Player's region ID
+### Chatbox (Variable features)
+- Game messages and level up notifications
+- Recent chat history
 
-#### **9. Skills (2 features)**
-- `crafting.level` - Current crafting level
-- `crafting.xp` - Current crafting experience
-
-#### **10. Chatbox (Variable features)**
-- Recent chat messages with type, sender, text, timestamp
-- Important for game feedback and status messages
-
-#### **11. Tabs (13+ features)**
+### Tabs (Variable features)
 - Current active tab
-- Inventory contents (duplicate of main inventory)
-- Equipment contents
-- Combat styles
-- Magic spells
-- Prayers
+- Tab contents (inventory, equipment, combat, magic, prayer)
 - Achievement diary progress
 
-## Data Output
+### Mouse and Interaction (Variable features)
+- Mouse canvas position
+- Objects under cursor
+- Selected scene tile (last right-clicked)
+- Closest structures to player
 
-### **Main File**
-- `runelite_gamestate.json` - Updated every game tick
-- Contains all current game state
+### Phase Context (5 features)
+- Current activity phase
+- Phase duration and gamestate count
+- Crafting status
 
-### **Per-Tick Files** (if enabled)
-- `gamestates/{timestamp}.json` - Individual tick snapshots
-- `runelite_screenshots/{timestamp}.png` - Screenshots
+### Widget Tracking (Variable features)
+- Crafting interface widgets
+- Bank item positions
+- Bank close button
 
-### **Configuration**
-- Output paths configurable via plugin settings
-- Data saving can be enabled/disabled
-- Screenshot and per-tick JSON saving optional
+## Total Features: 100+ (varies based on game state)
 
-## Benefits of Optimization
+## Configuration
 
-1. **Reduced Data Volume**: ~60-70% reduction in data size
-2. **Faster Processing**: Less data to parse and analyze
-3. **Focused Features**: Only relevant information for crafting
-4. **Better Performance**: Reduced memory usage and processing time
-5. **Cleaner Training Data**: No irrelevant features to confuse the model
+- **Output Path**: Main gamestate JSON file location
+- **Screenshot Directory**: Where screenshots are saved
+- **Per-tick JSON Directory**: Where individual tick data is saved
+- **Enable Data Saving**: Toggle for comprehensive data collection
+- **Enable Screenshots**: Toggle for screenshot capture
+- **Bot Mode**: Switch between training and bot operation modes
+
+## Bot Modes
+
+- **NONE**: Normal training data collection
+- **TRAINING**: Training mode with rolling buffer
+- **LIVE**: Live bot operation with rolling buffer
+
+## Data Format
+
+The plugin exports data in JSON format with the following structure:
+- Timestamp and world information
+- Player state and movement
+- Camera and view information
+- Inventory and bank contents
+- Game objects and NPCs
+- UI state and widgets
+- Mouse and interaction data
+- Phase and context information
 
 ## Usage
 
 1. Install the plugin in RuneLite
-2. Configure output paths in plugin settings
-3. Enable/disable data saving as needed
-4. The plugin automatically collects data every game tick
-5. Use the generated JSON files for training your IL bot
+2. Configure output paths and options
+3. Start the game and begin activities
+4. Data is automatically exported each game tick
+5. Use the exported data for bot training and analysis
 
-## Crafting-Specific Features
+## Notes
 
-The plugin is specifically optimized for sapphire ring crafting by:
-- Tracking inventory materials (sapphires, gold bars)
-- Monitoring bank contents for material availability
-- Following crafting skill progression
-- Capturing relevant game objects (furnaces, banks)
-- Recording essential UI state (tabs, dialogs)
+- Camera scale provides zoom level information
+- Mouse cursor tracking shows what's under the cursor
+- Selected tile tracking captures last right-clicked location
+- Closest structures are prioritized by distance
+- All items, objects, and NPCs include composition data
+- Phase detection automatically identifies current activity
+- Rolling buffer maintains recent gamestates for bot operation
