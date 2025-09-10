@@ -7,6 +7,7 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.Point;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.MenuOpened;
 import net.runelite.api.events.MenuOptionClicked;
@@ -17,7 +18,9 @@ import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.game.ItemManager;
 
+import net.runelite.client.util.Text;  // for stripping <col=...> etc
 import net.runelite.client.input.MouseAdapter;
 import net.runelite.client.input.MouseListener;
 import java.awt.event.MouseEvent;
@@ -40,7 +43,6 @@ import java.util.concurrent.TimeUnit;
 
 import net.runelite.client.callback.ClientThread;
 
-
 @Slf4j
 @PluginDescriptor(
     name = "State Exporter 2"
@@ -49,6 +51,8 @@ public class StateExporter2Plugin extends Plugin
 {
     private static final int WIDGET_CRAFTING_INTERFACE = 29229056;
     private static final int WIDGET_MAKE_SAPPHIRE_RINGS = 29229065;
+    private static final int WIDGET_MAKE_EMERALD_RINGS = 29229066;
+    private static final int WIDGET_MAKE_GOLD_RINGS = 29229064;
 
     // Logging system
     @Inject
@@ -59,6 +63,10 @@ public class StateExporter2Plugin extends Plugin
 
     @Inject
     private ConfigManager configManager;
+
+    @Inject
+    private ItemManager itemManager;
+
 
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
 
@@ -255,6 +263,28 @@ public class StateExporter2Plugin extends Plugin
             Map<String, Object> gameData = extractGameData();
             gamestate.put("data", gameData);
 
+            Map<String, Object> ge = null;
+            try {
+                Object maybe = gameData.get("grand_exchange");
+                if (maybe instanceof Map) {
+                    // unchecked cast ok for our usage here
+                    ge = (Map<String, Object>) maybe;
+                }
+            } catch (Exception ignored) {}
+
+            if (ge == null) {
+                ge = new HashMap<>();
+            }
+
+            // add/overwrite ONLY the location fields; keep open/widgets that extractGameData() populated
+            WorldPoint geCenter = new WorldPoint(3165, 3487, 0);
+            ge.put("worldX", geCenter.getX());
+            ge.put("worldY", geCenter.getY());
+            ge.put("plane",  geCenter.getPlane());
+
+            // put the merged map back
+            gameData.put("grand_exchange", ge);
+
             Map<String, Object> lastClick = new HashMap<>();
             if (lastClickCanvas != null)
             {
@@ -271,7 +301,6 @@ public class StateExporter2Plugin extends Plugin
                 lastClick.put("sinceMs", null);
             }
             gameData.put("lastClick", lastClick);
-
 
             // Get the gamestates directory
             String gamestatesDir = config.gamestatesDirectory();
@@ -420,7 +449,189 @@ public class StateExporter2Plugin extends Plugin
             
             // Closest Game Objects
             data.put("closestGameObjects", getClosestGameObjects());
-            
+
+            // === BEGIN: GE booth scan (verbatim-style from your dev shell) ===
+            log.info("Hello {}", client.getGameState());
+
+            final String needle = "grand exchange";
+
+            List<Map<String, Object>> geBooths = new ArrayList<>();
+
+            Tile[][] planeTiles = client.getScene().getTiles()[client.getPlane()];
+            if (planeTiles != null) {
+                for (Tile[] row : planeTiles) {
+                    if (row == null) continue;
+                    for (Tile tile : row) {
+                        if (tile == null) continue;
+
+                        // Helper to test a TileObject by id -> name (same as shell; using log.info)
+                        java.util.function.Consumer<net.runelite.api.TileObject> check = (to) -> {
+                            if (to == null) return;
+                            ObjectComposition def = client.getObjectDefinition(to.getId());
+                            if (def == null) return;
+                            String name = def.getName();
+                            if (name != null && name.toLowerCase().contains(needle)) {
+
+                                // Collect into gamestate JSON (minimal shape)
+                                Map<String, Object> m = new HashMap<>();
+                                m.put("id", to.getId());
+                                m.put("name", name);
+                                m.put("type", to.getClass().getSimpleName());
+                                m.put("worldX", to.getWorldLocation().getX());
+                                m.put("worldY", to.getWorldLocation().getY());
+
+                                // Canvas fallback (keep it super simple)
+                                Point canvasPt = to.getCanvasLocation();
+                                if (canvasPt != null) {
+                                    m.put("canvasX", canvasPt.getX());
+                                    m.put("canvasY", canvasPt.getY());
+                                } else {
+                                    m.put("canvasX", -1);
+                                    m.put("canvasY", -1);
+                                }
+
+                                // Clickbox if available (GameObject only); ignore errors
+                                try {
+                                    if (to instanceof GameObject) {
+                                        Rectangle r = ((GameObject) to).getClickbox().getBounds();
+                                        Map<String, Integer> cb = new HashMap<>();
+                                        cb.put("x", r.x);
+                                        cb.put("y", r.y);
+                                        cb.put("width", r.width);
+                                        cb.put("height", r.height);
+                                        m.put("clickbox", cb);
+                                    } else {
+                                        m.put("clickbox", null);
+                                    }
+                                } catch (Exception e) {
+                                    m.put("clickbox", null);
+                                }
+
+                                geBooths.add(m);
+                            }
+                        };
+
+                        // Game objects (most interactables, incl. GE booth)
+                        GameObject[] gos = tile.getGameObjects();
+                        if (gos != null) for (GameObject go : gos) check.accept(go);
+
+                        // Walls / deco / ground (just in case)
+                        check.accept(tile.getWallObject());
+                        check.accept(tile.getDecorativeObject());
+                        check.accept(tile.getGroundObject());
+                    }
+                }
+            }
+
+            data.put("ge_booths", geBooths);
+            // === END: GE booth scan ===
+
+            // ---- Grand Exchange widgets/state ----
+            Map<String, Object> ge = new HashMap<>();
+            Widget geRoot = client.getWidget(30474240); // root container you mentioned
+            boolean geOpen = (geRoot != null);
+            ge.put("open", geOpen);
+            ge.put("rootId", 30474240);
+
+            // Flat widget map keyed by id (easy lookups by your Python plan)
+            Map<String, Object> geWidgets = new HashMap<>();
+            int[] ids = new int[]{
+                    30474240,          // GE root
+                    30474244,          // Offer panel exists check (your "post confirm" indicator)
+                    30474246,           // <-- Collect lives under here on some layouts
+                    30474266,          // shared id for (-5%), (+X%), Confirm, Qty box, etc.
+                    30474247,30474248,30474249,30474250,30474251,30474252,30474253,30474254 // offer slots
+
+            };
+            for (int id : ids) putWidgetIfPresent(geWidgets, id, client);
+
+            for (int id : new int[]{30474246, 30474266,
+                    30474247,30474248,30474249,30474250,30474251,30474252,30474253,30474254})
+            {
+                try {
+                    Widget w = client.getWidget(id);
+                    if (w != null && !w.isHidden() && w.getChildren() != null) {  // <—
+                        int idx = 0;
+                        for (Widget c : w.getChildren()) {
+                            if (c == null || c.isHidden()) { idx++; continue; }    // <—
+                            Map<String, Object> cj = widgetFlatJson(c);
+                            if (cj != null) {
+                                // optionally discard invisible/zero-size children
+                                Map<String, Object> b = (Map<String, Object>) cj.get("bounds");
+                                if (b != null &&
+                                        ((Number)b.get("width")).intValue() > 0 &&
+                                        ((Number)b.get("height")).intValue() > 0)
+                                {
+                                    geWidgets.put(id + ":" + idx, cj);
+                                }
+                            }
+                            idx++;
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
+
+
+
+            ge.put("widgets", geWidgets);
+            data.put("grand_exchange", ge);
+
+            // ---- GE "inventory" panel (appears while GE is open) ----
+            // Parent container for items shown while GE is open: 30605312
+            Map<String, Object> geInv = new HashMap<>();
+            Widget geInvParent = client.getWidget(30605312);
+            if (geInvParent != null && geInvParent.getChildren() != null) {
+                List<Map<String, Object>> items = new ArrayList<>();
+                for (Widget c : geInvParent.getChildren()) {
+                    if (c == null) continue;
+                    Map<String, Object> cj = geInvChildJson(c);
+                    if (cj != null) {
+                        // Optional: only keep actual item-like entries (either has itemId>0 or a non-empty stripped name)
+                        Integer iid = (Integer) cj.getOrDefault("itemId", -1);
+                        String ns = (String) cj.get("nameStripped");
+                        String ts = (String) cj.get("textStripped");
+                        if ((iid != null && iid > 0) || (ns != null && !ns.isEmpty()) || (ts != null && !ts.isEmpty())) {
+                            items.add(cj);
+                        }
+                    }
+                }
+                geInv.put("parentId", 30605312);
+                geInv.put("items", items); // each item has {id, text/name raw+stripped, itemId/qty(if any), bounds}
+            }
+            // Always put the key so your consumer code can branch safely
+            data.put("ge_inventory", geInv);
+
+
+            // ---- Inventory slot widget bounds (for "Offer" clicks) ----
+            Map<String, Object> invWidgets = new HashMap<>();
+            try {
+                Widget inv = client.getWidget(WidgetInfo.INVENTORY);
+                if (inv != null && inv.getChildren() != null) {
+                    Widget[] kids = inv.getChildren();
+                    for (int slot = 0; slot < kids.length; slot++) {
+                        Widget c = kids[slot];
+                        if (c == null) continue;
+                        Map<String, Object> wj = widgetFlatJson(c);
+                        if (wj != null) invWidgets.put(String.valueOf(slot), wj);
+                    }
+                }
+            } catch (Exception ignored) {}
+            data.put("inventory_widgets", invWidgets);
+
+            // ---- (optional) simple price cache for items you care about ----
+            Map<String, Integer> gePrices = new HashMap<>();
+            try {
+                // You can add more here or wire a request list; keep simple as scaffolding
+                gePrices.put("Sapphire", itemManager.getItemPrice(1607));
+                gePrices.put("Emerald",  itemManager.getItemPrice(1605));
+                gePrices.put("Gold bar", itemManager.getItemPrice(2357));
+                // rings (noted or not) if you want to log them:
+                gePrices.put("Sapphire ring", itemManager.getItemPrice(1637));
+                gePrices.put("Emerald ring",  itemManager.getItemPrice(1639));
+            } catch (Exception ignored) {}
+            data.put("ge_prices", gePrices);
+
+
             // Menu entries
             MenuEntry[] menuEntries = client.getMenuEntries();
             List<Map<String, Object>> menuInfo = new ArrayList<>();
@@ -529,7 +740,26 @@ public class StateExporter2Plugin extends Plugin
 
             // Attach to your export payload
             data.put("bank", bank);
-            
+
+            // ---- Bank control widgets (withdraw as note / quantity all) ----
+            try {
+                Widget wNoteToggle = client.getWidget(786458);   // "Withdraw as note"
+                Widget wQtyAll     = client.getWidget(786470);   // "Quantity: All"
+
+                Map<String, Object> bankWidgets = new HashMap<>();
+                bankWidgets.put("withdraw_note_toggle", widgetBoundsJson(wNoteToggle));
+                bankWidgets.put("withdraw_quantity_all", widgetBoundsJson(wQtyAll));
+
+                data.put("bank_widgets", bankWidgets);
+            } catch (Exception e) {
+                // Keep JSON stable even if widgets are missing
+                Map<String, Object> bankWidgets = new HashMap<>();
+                bankWidgets.put("withdraw_note_toggle", null);
+                bankWidgets.put("withdraw_quantity_all", null);
+                data.put("bank_widgets", bankWidgets);
+            }
+
+
             // Inventory detailed slot information
             Map<String, Object> inventoryInfo = new HashMap<>();
             ItemContainer inventory = client.getItemContainer(InventoryID.INVENTORY);
@@ -608,17 +838,22 @@ public class StateExporter2Plugin extends Plugin
 
             data.put("inventory", inventoryInfo);
 
+            data.put("tiles_15x15", collectTiles15x15());
 
             // ---- Crafting widgets: export bounds (or null if missing)
             Widget wCrafting = client.getWidget(WIDGET_CRAFTING_INTERFACE);
-            Widget wMakeRing = client.getWidget(WIDGET_MAKE_SAPPHIRE_RINGS);
+            Widget wMakeSapphireRing = client.getWidget(WIDGET_MAKE_SAPPHIRE_RINGS);
+            Widget wMakeEmeraldRing = client.getWidget(WIDGET_MAKE_EMERALD_RINGS);
+            Widget wMakeGoldRing = client.getWidget(WIDGET_MAKE_GOLD_RINGS);
             Map<String, Object> craftingWidgets = new HashMap<>();
             craftingWidgets.put("crafting_interface", widgetBoundsJson(wCrafting));
-            craftingWidgets.put("make_sapphire_rings", widgetBoundsJson(wMakeRing));
+            craftingWidgets.put("make_sapphire_rings", widgetBoundsJson(wMakeSapphireRing));
+            craftingWidgets.put("make_emerald_rings", widgetBoundsJson(wMakeEmeraldRing));
+            craftingWidgets.put("make_gold_rings", widgetBoundsJson(wMakeGoldRing));
             data.put("crafting_widgets", craftingWidgets);
 
              // Crafting interface status - simplified check
-             boolean craftingInterfaceOpen = (wCrafting != null) || (wMakeRing != null);
+             boolean craftingInterfaceOpen = (wCrafting != null);
              data.put("craftingInterfaceOpen", craftingInterfaceOpen);
             
             // Last interaction data
@@ -823,6 +1058,10 @@ public class StateExporter2Plugin extends Plugin
         {
             NPCComposition npcDef = client.getNpcDefinition(npc.getId());
             npcInfo.put("actions", npcDef.getActions());
+            LocalPoint lp = LocalPoint.fromWorld(client, npcPos);
+            Point c = (lp != null) ? Perspective.localToCanvas(client, lp, npcPos.getPlane()) : null;
+            npcInfo.put("canvasX", c != null ? c.getX() : -1);
+            npcInfo.put("canvasY", c != null ? c.getY() : -1);
         }
         catch (Exception e)
         {
@@ -831,7 +1070,117 @@ public class StateExporter2Plugin extends Plugin
         
         return npcInfo;
     }
-    
+
+    // --- GE constants: confirmed from your shell output ---
+    private static final int GE_BOOTH_ID_A = 10060;
+    private static final int GE_BOOTH_ID_B = 10061;
+
+    // Minimal “tile object → info” for GameObject/TileObject (mirrors your createGameObjectInfo)
+    private Map<String, Object> createTileObjectInfo(TileObject to, WorldPoint playerPos)
+    {
+        Map<String, Object> objInfo = new HashMap<>();
+        WorldPoint objPos = to.getWorldLocation();
+
+        objInfo.put("id", to.getId());
+        objInfo.put("worldX", objPos.getX());
+        objInfo.put("worldY", objPos.getY());
+        objInfo.put("plane", objPos.getPlane());
+        objInfo.put("distance", playerPos.distanceTo(objPos));
+
+        try {
+            ObjectComposition objDef = client.getObjectDefinition(to.getId());
+            objInfo.put("name", (objDef != null) ? objDef.getName() : "Unknown");
+            objInfo.put("actions", (objDef != null) ? objDef.getActions() : new String[0]);
+
+            // Canvas (fallback targeting)
+            Point canvasPos = to.getCanvasLocation();
+            objInfo.put("canvasX", canvasPos != null ? canvasPos.getX() : -1);
+            objInfo.put("canvasY", canvasPos != null ? canvasPos.getY() : -1);
+
+            // Clickbox when available (GameObject only)
+            try {
+                if (to instanceof GameObject) {
+                    Rectangle r = ((GameObject) to).getClickbox().getBounds();
+                    Map<String, Object> clickbox = new HashMap<>();
+                    clickbox.put("x", r.x);
+                    clickbox.put("y", r.y);
+                    clickbox.put("width", r.width);
+                    clickbox.put("height", r.height);
+                    objInfo.put("clickbox", clickbox);
+                } else {
+                    objInfo.put("clickbox", null);
+                }
+            } catch (Exception e) {
+                objInfo.put("clickbox", null);
+            }
+        } catch (Exception e) {
+            objInfo.put("name", "Unknown");
+            objInfo.put("actions", new String[0]);
+            objInfo.put("canvasX", -1);
+            objInfo.put("canvasY", -1);
+            objInfo.put("clickbox", null);
+        }
+
+        return objInfo;
+    }
+
+    // Scan the current plane for GE booths (IDs first; name fallback)
+    private List<Map<String, Object>> collectGEBooths()
+    {
+        List<Map<String, Object>> out = new ArrayList<>();
+        Player lp = client.getLocalPlayer();
+        if (lp == null) return out;
+
+        WorldPoint me = lp.getWorldLocation();
+        int plane = client.getPlane();
+        Tile[][] tiles = client.getScene().getTiles()[plane];
+        if (tiles == null) return out;
+
+        for (Tile[] row : tiles) {
+            if (row == null) continue;
+            for (Tile tile : row) {
+                if (tile == null) continue;
+
+                GameObject[] gos = tile.getGameObjects();
+                if (gos == null) continue;
+                for (GameObject go : gos) {
+                    if (go == null) continue;
+
+                    int id = go.getId();
+                    boolean matchById = (id == GE_BOOTH_ID_A || id == GE_BOOTH_ID_B);
+                    boolean matchByName = false;
+
+                    if (!matchById) {
+                        try {
+                            ObjectComposition def = client.getObjectDefinition(id);
+                            String nm = (def != null) ? def.getName() : null;
+                            matchByName = (nm != null && nm.equalsIgnoreCase("Grand Exchange booth"));
+                        } catch (Exception ignored) {}
+                    }
+
+                    if (matchById || matchByName) {
+                        out.add(createTileObjectInfo(go, me));
+                    }
+                }
+            }
+        }
+
+        // Keep nearest first (helps your consumer pick a sensible one)
+        out.sort((a, b) -> Double.compare(
+                ((Number)a.getOrDefault("distance", 9e9)).doubleValue(),
+                ((Number)b.getOrDefault("distance", 9e9)).doubleValue()
+        ));
+        return out;
+    }
+
+    // (Optional) very lightweight flag; you can replace with exact widget checks later.
+    private boolean isGEInterfaceOpen()
+    {
+        // TODO: Replace with precise widget checks when you wire GE UI (groupId etc.)
+        // For now, conservative default:
+        return false;
+    }
+
     /**
      * Create Game Object info map
      */
@@ -914,6 +1263,41 @@ public class StateExporter2Plugin extends Plugin
         
         log.info("Gamestates directory updated to: {}", newDirectory);
     }
+
+    // --- Helpers ---
+    private Map<String, Object> widgetRect(Widget w)
+    {
+        if (w == null) return null;
+        Rectangle r = w.getBounds();
+        if (r == null) return null;
+        Map<String, Object> b = new HashMap<>();
+        b.put("x", r.x); b.put("y", r.y); b.put("width", r.width); b.put("height", r.height);
+        return b;
+    }
+
+    private Map<String, Object> widgetFlatJson(Widget w)
+    {
+        if (w == null) return null;
+        Map<String, Object> m = new HashMap<>();
+        m.put("id", w.getId());
+        try { m.put("text", w.getText()); } catch (Exception ignored) {}
+        try { m.put("textStripped", stripTags(w.getText())); } catch (Exception ignored) { m.put("textStripped", null); }
+        try { m.put("spriteId", w.getSpriteId()); } catch (Exception ignored) {}
+        Map<String, Object> b = widgetRect(w);
+        if (b != null) m.put("bounds", b);
+        return m;
+    }
+
+    private void putWidgetIfPresent(Map<String, Object> out, int id, Client client)
+    {
+        try {
+            Widget w = client.getWidget(id);
+            if (w != null && !w.isHidden()) {              // <—
+                out.put(String.valueOf(id), widgetFlatJson(w));
+            }
+        } catch (Exception ignored) {}
+    }
+
 
     private static Map<String, Object> widgetBoundsJson(Widget w)
     {
@@ -998,6 +1382,77 @@ public class StateExporter2Plugin extends Plugin
             }
         }
     }
+
+    private static String stripTags(String s) {
+        return (s == null) ? null : Text.removeTags(s).trim();
+    }
+
+    /** GE inv item widget → flat json (id, text/name raw+stripped, itemId/qty, bounds) */
+    private Map<String, Object> geInvChildJson(Widget w) {
+        if (w == null) return null;
+        Map<String, Object> m = new HashMap<>();
+        m.put("id", w.getId());
+        try { m.put("text", w.getText()); } catch (Exception ignored) {}
+        try { m.put("name", w.getName()); } catch (Exception ignored) {}
+        try { m.put("textStripped", stripTags(w.getText())); } catch (Exception ignored) { m.put("textStripped", null); }
+        try { m.put("nameStripped", stripTags(w.getName())); } catch (Exception ignored) { m.put("nameStripped", null); }
+        try { m.put("itemId", w.getItemId()); } catch (Exception ignored) { m.put("itemId", -1); }
+        try { m.put("itemQuantity", w.getItemQuantity()); } catch (Exception ignored) { m.put("itemQuantity", 0); }
+        Map<String, Object> b = widgetRect(w); // your existing bounds helper -> {"x","y","width","height"}
+        if (b != null) m.put("bounds", b);
+        return m;
+    }
+
+
+    private List<Map<String, Object>> collectTiles15x15()
+    {
+        List<Map<String, Object>> out = new ArrayList<>();
+
+        Player lp = client.getLocalPlayer();
+        if (lp == null) {
+            return out;
+        }
+
+        WorldPoint here = lp.getWorldLocation();
+        int plane = client.getPlane();
+        int radius = 15;
+
+        for (int dx = -radius; dx <= radius; dx++)
+        {
+            for (int dy = -radius; dy <= radius; dy++)
+            {
+                WorldPoint wp = new WorldPoint(here.getX() + dx, here.getY() + dy, plane);
+                LocalPoint lpnt = LocalPoint.fromWorld(client, wp);
+                if (lpnt == null) {
+                    continue; // not in scene
+                }
+
+                Point canvas = Perspective.localToCanvas(client, lpnt, plane);
+
+                Map<String, Object> tile = new HashMap<>();
+                tile.put("worldX", wp.getX());
+                tile.put("worldY", wp.getY());
+                tile.put("plane", plane);
+                tile.put("canvasX", (canvas != null) ? canvas.getX() : -1);
+                tile.put("canvasY", (canvas != null) ? canvas.getY() : -1);
+
+                out.add(tile);
+            }
+        }
+        return out;
+    }
+
+    // Put this INSIDE the class (e.g., near other helpers)
+    private List<WorldPoint> demoPathTo(int goalX, int goalY)
+    {
+        // TODO: implement real A* later; placeholder returns just the goal
+        Player lp = client.getLocalPlayer();
+        int plane = (lp != null) ? lp.getWorldLocation().getPlane() : 0;
+        List<WorldPoint> out = new ArrayList<>();
+        out.add(new WorldPoint(goalX, goalY, plane));
+        return out;
+    }
+
 
 
 }
