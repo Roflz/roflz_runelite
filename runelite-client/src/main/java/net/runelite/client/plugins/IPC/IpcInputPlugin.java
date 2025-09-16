@@ -29,6 +29,8 @@ import net.runelite.client.config.ConfigManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
+import static net.runelite.api.CollisionDataFlag.*;
+
 
 /**
  * IPC Input + Path overlay with verbose debug.
@@ -499,6 +501,24 @@ public class IpcInputPlugin extends Plugin
                                 break;
                             }
 
+                            case "objects": {
+                                final String q = (cmd.objName == null) ? "" : cmd.objName.trim();
+                                if (q.isEmpty()) { out.println("{\"ok\":false,\"err\":\"need name\"}"); break; }
+
+                                final java.util.Set<String> typeSet = new java.util.HashSet<>();
+                                if (cmd.types != null) {
+                                    for (String t : cmd.types) if (t != null) typeSet.add(t.toUpperCase());
+                                } else {
+                                    typeSet.add("WALL"); typeSet.add("GAME"); typeSet.add("DECOR");
+                                }
+                                final int radius = (cmd.radius == null) ? 22 : Math.max(1, Math.min(52, cmd.radius));
+
+                                final java.util.Map<String,Object> resp = getObjectsOnClientThread(q, typeSet, radius, 120);
+                                out.println(gson.toJson(resp));
+                                break;
+                            }
+
+
                             case "mask": {
                                 int r = (cmd.radius == null) ? 15 : Math.max(1, Math.min(30, cmd.radius));
                                 Map<String,Object> m = buildMask(r);
@@ -843,6 +863,63 @@ public class IpcInputPlugin extends Plugin
             return resp;
         }
 
+        // Snapshot of where door-like WallObjects exist on the current plane.
+// Returns doorHere[104][104], true if a tile has a "door"/"gate" wall object.
+        private boolean[][] buildDoorHereMaskOnClientThread(
+                Client client,
+                ClientThread clientThread,
+                int plane,
+                int timeoutMs
+        ) {
+            final java.util.concurrent.CompletableFuture<boolean[][]> fut = new java.util.concurrent.CompletableFuture<>();
+
+            clientThread.invokeLater(() -> {
+                final boolean[][] doorHere = new boolean[104][104];
+                try {
+                    final Scene scene = client.getScene();
+                    if (scene == null) { fut.complete(doorHere); return; }
+
+                    final Tile[][][] tilesArr = scene.getTiles();
+                    if (tilesArr == null || plane < 0 || plane >= tilesArr.length || tilesArr[plane] == null) {
+                        fut.complete(doorHere); return;
+                    }
+
+                    final int baseX = client.getBaseX();
+                    final int baseY = client.getBaseY();
+
+                    for (int lx = 0; lx < 104; lx++) {
+                        final Tile[] col = tilesArr[plane][lx];
+                        if (col == null) continue;
+                        for (int ly = 0; ly < 104; ly++) {
+                            final Tile tile = col[ly];
+                            if (tile == null) continue;
+
+                            final WallObject wobj = tile.getWallObject();
+                            if (wobj == null) continue;
+
+                            // "Door" / "Gate" heuristic
+                            try {
+                                final ObjectComposition comp = client.getObjectDefinition(wobj.getId());
+                                final String nm = (comp != null && comp.getName() != null) ? comp.getName().toLowerCase() : "";
+                                if (!nm.isEmpty() && (nm.contains("door") || nm.contains("gate"))) {
+                                    doorHere[lx][ly] = true;
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    }
+                } catch (Throwable t) {
+                    // fall through with all-false mask
+                } finally {
+                    fut.complete(doorHere);
+                }
+            });
+
+            try {
+                return fut.get(Math.max(1, timeoutMs), java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (Exception e) {
+                return new boolean[104][104]; // all false
+            }
+        }
 
         private Map<String,Object> buildMask(int radius)
         {
@@ -1014,6 +1091,9 @@ public class IpcInputPlugin extends Plugin
             }
             final int[][] flags = cms[dbg.plane].getFlags();
 
+            // Snapshot where doors are in-scene on this plane (client thread safe)
+            final boolean[][] doorHere = buildDoorHereMaskOnClientThread(client, clientThread, dbg.plane, 100);
+
             dbg.baseX = client.getBaseX();
             dbg.baseY = client.getBaseY();
 
@@ -1029,11 +1109,6 @@ public class IpcInputPlugin extends Plugin
 
             dbg.startInScene = inScene(dbg.startLx, dbg.startLy);
             dbg.goalInScene  = inScene(dbg.goalLx,  dbg.goalLy);
-
-//            log.info("[IPC] computePathTowardScene: plane={} base=({}, {}) startW=({}, {}) startL=({}, {}) goalW=({}, {}) goalL=({}, {}) goalInScene={}",
-//                    dbg.plane, dbg.baseX, dbg.baseY,
-//                    dbg.startWx, dbg.startWy, dbg.startLx, dbg.startLy,
-//                    dbg.goalWx, dbg.goalWy, dbg.goalLx, dbg.goalLy, dbg.goalInScene);
 
             if (!dbg.startInScene) {
                 dbg.whyFailed = "start-off-scene";
@@ -1108,21 +1183,10 @@ public class IpcInputPlugin extends Plugin
 
                     if (!inScene(nx, ny) || seen[nx][ny]) continue;
 
-                    // Destination must be walkable
-                    if (!isWalkableLocal(flags, nx, ny)) { skippedBlocked++; continue; }
-
-                    // If diagonal, enforce no-corner-cutting:
-                    // both adjacent cardinals must be walkable: (cx+dx, cy) and (cx, cy+dy)
-                    if (dx != 0 && dy != 0) {
-                        int adj1x = cx + dx, adj1y = cy;
-                        int adj2x = cx,       adj2y = cy + dy;
-
-                        if (!inScene(adj1x, adj1y) || !inScene(adj2x, adj2y)
-                                || !isWalkableLocal(flags, adj1x, adj1y)
-                                || !isWalkableLocal(flags, adj2x, adj2y)) {
-                            skippedCorner++;
-                            continue;
-                        }
+                    if (!canStep(flags, doorHere, cx, cy, dx, dy)) {
+                        // optional: diagnostics counters
+                        // if (dx == 0 || dy == 0) skippedBlocked++; else skippedCorner++;
+                        continue;
                     }
 
                     seen[nx][ny] = true;
@@ -1130,6 +1194,8 @@ public class IpcInputPlugin extends Plugin
                     dq.addLast(new int[]{nx, ny});
                     enqueued++;
                 }
+
+
             }
 
             dbg.expansions = expansions;
@@ -1423,6 +1489,202 @@ public class IpcInputPlugin extends Plugin
             }
         }
 
+        private Map<String,Object> getObjectsOnClientThread(
+                String query,
+                java.util.Set<String> types,
+                int radius,
+                int timeoutMs
+        ) {
+            final java.util.concurrent.CompletableFuture<Map<String,Object>> fut = new java.util.concurrent.CompletableFuture<>();
+
+            clientThread.invokeLater(() -> {
+                final Map<String,Object> resp = new LinkedHashMap<>();
+                final java.util.List<Map<String,Object>> out = new java.util.ArrayList<>();
+                try {
+                    final Player me = client.getLocalPlayer();
+                    final Scene scene = client.getScene();
+                    if (me == null || scene == null) { resp.put("ok", false); resp.put("err", "no-player-or-scene"); fut.complete(resp); return; }
+
+                    final int plane = client.getPlane();
+                    final int baseX = client.getBaseX(), baseY = client.getBaseY();
+                    final int cx = me.getWorldLocation().getX(), cy = me.getWorldLocation().getY();
+
+                    final Tile[][][] tiles = scene.getTiles();
+                    if (tiles == null || plane < 0 || plane >= tiles.length || tiles[plane] == null) {
+                        resp.put("ok", false); resp.put("err", "no-tiles"); fut.complete(resp); return;
+                    }
+
+                    final String q = query.toLowerCase();
+
+                    // scan square neighborhood (clamped to scene)
+                    final int minWx = Math.max(baseX, cx - radius);
+                    final int maxWx = Math.min(baseX + 103, cx + radius);
+                    final int minWy = Math.max(baseY, cy - radius);
+                    final int maxWy = Math.min(baseY + 103, cy + radius);
+
+                    for (int wx = minWx; wx <= maxWx; wx++) {
+                        for (int wy = minWy; wy <= maxWy; wy++) {
+                            final int lx = wx - baseX, ly = wy - baseY;
+                            final Tile tile = tiles[plane][lx][ly];
+                            if (tile == null) continue;
+
+                            // WALL objects
+                            if (types.contains("WALL")) {
+                                final WallObject w = tile.getWallObject();
+                                if (w != null) collectObject(out, w.getId(), "WALL", wx, wy, plane, w.getConvexHull(), q);
+                            }
+
+                            // GAME objects (1–5 slots)
+                            if (types.contains("GAME")) {
+                                final GameObject[] gos = tile.getGameObjects();
+                                if (gos != null) for (GameObject go : gos) {
+                                    if (go != null) collectObject(out, go.getId(), "GAME", wx, wy, plane, go.getConvexHull(), q);
+                                }
+                            }
+
+                            // DECOR (floor dec)
+                            if (types.contains("DECOR")) {
+                                final DecorativeObject d = tile.getDecorativeObject();
+                                if (d != null) collectObject(out, d.getId(), "DECOR", wx, wy, plane, d.getConvexHull(), q);
+                            }
+                        }
+                    }
+
+                    // pack response
+                    resp.put("ok", true);
+                    // include player world (helps client side scoring)
+                    resp.put("player", java.util.Map.of("x", cx, "y", cy, "p", plane));
+                    resp.put("objects", out);
+                } catch (Throwable t) {
+                    resp.put("ok", false); resp.put("err", "scan-failed");
+                } finally {
+                    fut.complete(resp);
+                }
+            });
+
+            try { return fut.get(Math.max(1, timeoutMs), java.util.concurrent.TimeUnit.MILLISECONDS); }
+            catch (Exception e) { return java.util.Map.of("ok", false, "err", "timeout"); }
+        }
+
+        private void collectObject(
+                java.util.List<Map<String,Object>> out,
+                int id,
+                String type,
+                int wx, int wy, int plane,
+                java.awt.Shape hull,
+                String qLower
+        ) {
+            // Name + actions from composition
+            final ObjectComposition comp = client.getObjectDefinition(id);
+            String name = (comp != null) ? comp.getName() : null;
+            final String nmLower = (name != null) ? name.toLowerCase() : "";
+            if (!nmLower.contains(qLower)) return;
+
+            final Map<String,Object> row = new LinkedHashMap<>();
+            row.put("id", id);
+            row.put("type", type);
+            row.put("name", name);
+            row.put("world", java.util.Map.of("x", wx, "y", wy, "p", plane));
+
+            if (comp != null) {
+                String[] acts = comp.getActions();
+                if (acts != null) {
+                    java.util.List<String> al = new java.util.ArrayList<>();
+                    for (String a : acts) if (a != null) al.add(a);
+                    row.put("actions", al);
+                }
+            }
+
+            // bounds/canvas center from convex hull if present
+            if (hull != null) {
+                final java.awt.Rectangle rb = hull.getBounds();
+                if (rb != null) {
+                    row.put("bounds", java.util.Map.of("x", rb.x, "y", rb.y, "width", rb.width, "height", rb.height));
+                    row.put("canvas", java.util.Map.of("x", rb.x + rb.width / 2, "y", rb.y + rb.height / 2));
+                    // orientation hint
+                    row.put("orientation", (rb.width > rb.height) ? "horizontal" : "vertical");
+                }
+            }
+            // fallback: tile center projection
+            try {
+                final LocalPoint lp = LocalPoint.fromWorld(client, wx, wy);
+                if (lp != null) {
+                    final net.runelite.api.Point pt = Perspective.localToCanvas(client, lp, plane);
+                    if (pt != null) {
+                        row.put("tileCanvas", java.util.Map.of("x", pt.getX(), "y", pt.getY()));
+                    }
+                }
+            } catch (Exception ignored) {}
+
+            out.add(row);
+        }
+
+        // A tile is hard-blocked (solid object etc.)
+        private static boolean hardBlocked(int[][] flags, int x, int y)
+        {
+            int f = flags[x][y];
+            return (f & (BLOCK_MOVEMENT_FULL | BLOCK_MOVEMENT_OBJECT | BLOCK_MOVEMENT_FLOOR)) != 0;
+        }
+
+        // Can we legally move from (x,y) -> (nx,ny) given dx,dy in {-1,0,1}?
+        private static boolean canStep(
+                int[][] flags,
+                boolean[][] doorHere,  // <— NEW
+                int x, int y,
+                int dx, int dy
+        ) {
+            final int nx = x + dx, ny = y + dy;
+            if (!inScene(nx, ny)) return false;
+
+            // If destination tile itself is hard-blocked, only allow if there's a door on either tile.
+            if (!isWalkableLocal(flags, nx, ny)) {
+                if (!(doorHere[x][y] || doorHere[nx][ny])) return false;
+                // allow through if a door is present on source or dest tile
+            }
+
+            // Cardinal step: check the edge bits. If blocked, allow if door on either tile.
+            if (dx == -1 && dy == 0) {
+                boolean edgeBlocked =
+                        ((flags[x][y] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_WEST) != 0) ||
+                                ((flags[nx][ny] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_EAST) != 0);
+                if (edgeBlocked && !(doorHere[x][y] || doorHere[nx][ny])) return false;
+                return true;
+            }
+            if (dx == 1 && dy == 0) {
+                boolean edgeBlocked =
+                        ((flags[x][y] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_EAST) != 0) ||
+                                ((flags[nx][ny] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_WEST) != 0);
+                if (edgeBlocked && !(doorHere[x][y] || doorHere[nx][ny])) return false;
+                return true;
+            }
+            if (dx == 0 && dy == 1) {
+                boolean edgeBlocked =
+                        ((flags[x][y] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_NORTH) != 0) ||
+                                ((flags[nx][ny] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_SOUTH) != 0);
+                if (edgeBlocked && !(doorHere[x][y] || doorHere[nx][ny])) return false;
+                return true;
+            }
+            if (dx == 0 && dy == -1) {
+                boolean edgeBlocked =
+                        ((flags[x][y] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_SOUTH) != 0) ||
+                                ((flags[nx][ny] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_NORTH) != 0);
+                if (edgeBlocked && !(doorHere[x][y] || doorHere[nx][ny])) return false;
+                return true;
+            }
+
+            // Diagonals require both adjacent cardinals to be valid steps (no corner cut).
+            // We reuse canStep() so doors on either cardinal edge also soften those checks.
+            if (dx == 1 && dy == 1)   return canStep(flags, doorHere, x, y, 1, 0)   && canStep(flags, doorHere, x, y, 0, 1);
+            if (dx == 1 && dy == -1)  return canStep(flags, doorHere, x, y, 1, 0)   && canStep(flags, doorHere, x, y, 0, -1);
+            if (dx == -1 && dy == 1)  return canStep(flags, doorHere, x, y, -1, 0)  && canStep(flags, doorHere, x, y, 0, 1);
+            if (dx == -1 && dy == -1) return canStep(flags, doorHere, x, y, -1, 0)  && canStep(flags, doorHere, x, y, 0, -1);
+
+            return false;
+        }
+
+
+
+
 
         /* ======================= CMD STRUCT ======================= */
 
@@ -1475,6 +1737,10 @@ public class IpcInputPlugin extends Plugin
             // inside IpcInputPlugin.ServerThread.Cmd
             @SerializedName("key") String key;   // e.g. "LEFT", "RIGHT", "esc"
             @SerializedName("ms")  Integer ms;   // hold duration in milliseconds
+
+            @SerializedName("name") String objName;     // substring, case-insensitive
+            @SerializedName("types") List<String> types; // e.g. ["WALL","GAME","DECOR"]
+
 
         }
     }
