@@ -48,6 +48,16 @@ public interface StateExporter2Config extends Config
     }
 
     @ConfigItem(
+            keyName = "objectScanRadius",
+            name = "Object scan radius",
+            description = "Tile radius around the player to scan for game objects / GE booths.",
+            position = 42
+    )
+    default int objectScanRadius() {
+        return 12; // sensible default; your code bounds it to [5..30]
+    }
+
+    @ConfigItem(
         keyName = "refreshDirectory",
         name = "Refresh Directory",
         description = "Click to refresh the gamestates directory to the latest recording session",

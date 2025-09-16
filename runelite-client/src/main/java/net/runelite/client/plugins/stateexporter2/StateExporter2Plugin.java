@@ -19,6 +19,8 @@ import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.game.ItemManager;
+import net.runelite.api.Quest;
+import net.runelite.api.QuestState;
 
 import net.runelite.client.util.Text;  // for stripping <col=...> etc
 import net.runelite.client.input.MouseAdapter;
@@ -54,6 +56,12 @@ public class StateExporter2Plugin extends Plugin
     private static final int WIDGET_MAKE_EMERALD_RINGS = 29229066;
     private static final int WIDGET_MAKE_GOLD_RINGS = 29229064;
 
+    private static final int CHATLEFT_NAME_ID     = 15138820; // S 231.4
+    private static final int CHATLEFT_CONTINUE_ID = 15138821; // S 231.5
+    private static final int CHATLEFT_TEXT_ID     = 15138822; // S 231.6
+
+    private static final int CHATMENU_OPTIONS_ID  = 14352385; // N 219.1
+
     // Logging system
     @Inject
     private Client client;
@@ -68,7 +76,12 @@ public class StateExporter2Plugin extends Plugin
     private ItemManager itemManager;
 
 
-    private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+    private final Gson gson = new GsonBuilder()
+            .setPrettyPrinting()
+            .disableHtmlEscaping()
+            .serializeNulls()
+            .create();
+
 
     @Inject
     private ClientThread clientThread;
@@ -245,116 +258,19 @@ public class StateExporter2Plugin extends Plugin
         }
     }
 
-
-    /**
-     * Export gamestate JSON with extracted data
-     */
-    private void exportGamestate()
-    {
-        try
-        {
-            // Create gamestate with extracted data
-            Map<String, Object> gamestate = new HashMap<>();
-            gamestate.put("timestamp", System.currentTimeMillis());
-            gamestate.put("plugin", "StateExporter2");
-            gamestate.put("version", "1.0.0");
-            
-            // Extract game state data
-            Map<String, Object> gameData = extractGameData();
-            gamestate.put("data", gameData);
-
-            Map<String, Object> ge = null;
-            try {
-                Object maybe = gameData.get("grand_exchange");
-                if (maybe instanceof Map) {
-                    // unchecked cast ok for our usage here
-                    ge = (Map<String, Object>) maybe;
-                }
-            } catch (Exception ignored) {}
-
-            if (ge == null) {
-                ge = new HashMap<>();
-            }
-
-            // add/overwrite ONLY the location fields; keep open/widgets that extractGameData() populated
-            WorldPoint geCenter = new WorldPoint(3165, 3487, 0);
-            ge.put("worldX", geCenter.getX());
-            ge.put("worldY", geCenter.getY());
-            ge.put("plane",  geCenter.getPlane());
-
-            // put the merged map back
-            gameData.put("grand_exchange", ge);
-
-            Map<String, Object> lastClick = new HashMap<>();
-            if (lastClickCanvas != null)
-            {
-                lastClick.put("canvasX", lastClickCanvas.getX());
-                lastClick.put("canvasY", lastClickCanvas.getY());
-                lastClick.put("epochMs", lastClickEpochMs);
-                lastClick.put("sinceMs", Math.max(0L, System.currentTimeMillis() - lastClickEpochMs));
-            }
-            else
-            {
-                lastClick.put("canvasX", null);
-                lastClick.put("canvasY", null);
-                lastClick.put("epochMs", null);
-                lastClick.put("sinceMs", null);
-            }
-            gameData.put("lastClick", lastClick);
-
-            // Get the gamestates directory
-            String gamestatesDir = config.gamestatesDirectory();
-            
-            // Create directory if it doesn't exist
-            File dir = new File(gamestatesDir);
-            if (!dir.exists())
-            {
-                boolean created = dir.mkdirs();
-                if (!created)
-                {
-                    log.error("Failed to create gamestates directory: {}", gamestatesDir);
-                    return;
-                }
-            }
-
-            ensureRoomForOne(dir, config.maxGamestateFiles());
-            // Create filename with timestamp
-            String filename = System.currentTimeMillis() + ".json";
-            File file = new File(dir, filename);
-
-            // Write JSON to file
-            try (FileWriter writer = new FileWriter(file))
-            {
-                gson.toJson(gamestate, writer);
-                log.debug("Exported gamestate to: {}", file.getAbsolutePath());
-                ensureRoomForOne(dir, config.maxGamestateFiles());
-                pruneGamestateFiles(dir, config.maxGamestateFiles());
-            }
-
-        }
-        catch (IOException e)
-        {
-            log.error("Failed to export gamestate: {}", e.getMessage());
-        }
-        catch (Exception e)
-        {
-            log.error("Unexpected error during gamestate export: {}", e.getMessage());
-        }
-    }
-
     /**
      * Extract game data using the same logic as your shell script
      */
     private Map<String, Object> extractGameData()
     {
         Map<String, Object> data = new HashMap<>();
-        
+
         try
         {
             // Basic game state
             data.put("gameState", client.getGameState().toString());
             data.put("currentWorld", client.getWorld());
-            
+
             // Player info
             Player localPlayer = client.getLocalPlayer();
             if (localPlayer != null)
@@ -368,14 +284,36 @@ public class StateExporter2Plugin extends Plugin
                 playerInfo.put("orientation", localPlayer.getOrientation());
                 data.put("player", playerInfo);
             }
-            
+
+            // ---- Camera state (for bot camera control) ----
+            try {
+                Map<String, Object> cam = new HashMap<>();
+                cam.put("X",     client.getCameraX());
+                cam.put("Y",     client.getCameraY());
+                cam.put("Z",     client.getCameraZ());
+                cam.put("Pitch", client.getCameraPitch());
+                cam.put("Yaw",   client.getCameraYaw());
+                cam.put("Scale", client.getScale());
+                cam.put("Zoom",  client.getScale()); // alias for convenience
+
+                data.put("camera", cam);
+            } catch (Exception ignored) {
+                // keep payload shape stable even if something goes wrong
+                Map<String, Object> cam = new HashMap<>();
+                cam.put("X", null); cam.put("Y", null); cam.put("Z", null);
+                cam.put("Pitch", null); cam.put("Yaw", null);
+                cam.put("Scale", null); cam.put("Zoom", null);
+                data.put("camera", cam);
+            }
+
+
             // Mouse and hovered tile info
             Point mousePos = client.getMouseCanvasPosition();
             Map<String, Object> mouseInfo = new HashMap<>();
             mouseInfo.put("canvasX", mousePos.getX());
             mouseInfo.put("canvasY", mousePos.getY());
             data.put("mouse", mouseInfo);
-            
+
             Tile hoveredTile = client.getSelectedSceneTile();
             if (hoveredTile != null)
             {
@@ -384,11 +322,11 @@ public class StateExporter2Plugin extends Plugin
                 tileInfo.put("worldX", worldPos.getX());
                 tileInfo.put("worldY", worldPos.getY());
                 tileInfo.put("plane", worldPos.getPlane());
-                
+
                 // Game objects on hovered tile
                 GameObject[] hoveredObjects = hoveredTile.getGameObjects();
                 List<Map<String, Object>> gameObjects = new ArrayList<>();
-                
+
                 for (int i = 0; i < hoveredObjects.length; i++)
                 {
                     GameObject object = hoveredObjects[i];
@@ -397,7 +335,7 @@ public class StateExporter2Plugin extends Plugin
                         Map<String, Object> objInfo = new HashMap<>();
                         objInfo.put("index", i);
                         objInfo.put("id", object.getId());
-                        
+
                         try
                         {
                             ObjectComposition objDef = client.getObjectDefinition(object.getId());
@@ -409,14 +347,14 @@ public class StateExporter2Plugin extends Plugin
                             objInfo.put("name", "Unknown");
                             objInfo.put("actions", new String[0]);
                         }
-                        
+
                         WorldPoint objectPos = object.getWorldLocation();
                         objInfo.put("worldX", objectPos.getX());
                         objInfo.put("worldY", objectPos.getY());
                         objInfo.put("plane", objectPos.getPlane());
                         objInfo.put("canvasX", object.getCanvasLocation().getX());
                         objInfo.put("canvasY", object.getCanvasLocation().getY());
-                        
+
                         try
                         {
                             Rectangle objectRect = object.getClickbox().getBounds();
@@ -431,11 +369,11 @@ public class StateExporter2Plugin extends Plugin
                         {
                             objInfo.put("clickbox", null);
                         }
-                        
+
                         gameObjects.add(objInfo);
                     }
                 }
-                
+
                 tileInfo.put("gameObjects", gameObjects);
                 data.put("hoveredTile", tileInfo);
             }
@@ -443,88 +381,14 @@ public class StateExporter2Plugin extends Plugin
             {
                 data.put("hoveredTile", null);
             }
-            
+
             // Closest NPCs
             data.put("closestNPCs", getClosestNPCs());
-            
-            // Closest Game Objects
-            data.put("closestGameObjects", getClosestGameObjects());
 
-            // === BEGIN: GE booth scan (verbatim-style from your dev shell) ===
-            log.info("Hello {}", client.getGameState());
+            ObjBag bag = collectNearbyObjectsOnce(bagRadius());
 
-            final String needle = "grand exchange";
-
-            List<Map<String, Object>> geBooths = new ArrayList<>();
-
-            Tile[][] planeTiles = client.getScene().getTiles()[client.getPlane()];
-            if (planeTiles != null) {
-                for (Tile[] row : planeTiles) {
-                    if (row == null) continue;
-                    for (Tile tile : row) {
-                        if (tile == null) continue;
-
-                        // Helper to test a TileObject by id -> name (same as shell; using log.info)
-                        java.util.function.Consumer<net.runelite.api.TileObject> check = (to) -> {
-                            if (to == null) return;
-                            ObjectComposition def = client.getObjectDefinition(to.getId());
-                            if (def == null) return;
-                            String name = def.getName();
-                            if (name != null && name.toLowerCase().contains(needle)) {
-
-                                // Collect into gamestate JSON (minimal shape)
-                                Map<String, Object> m = new HashMap<>();
-                                m.put("id", to.getId());
-                                m.put("name", name);
-                                m.put("type", to.getClass().getSimpleName());
-                                m.put("worldX", to.getWorldLocation().getX());
-                                m.put("worldY", to.getWorldLocation().getY());
-
-                                // Canvas fallback (keep it super simple)
-                                Point canvasPt = to.getCanvasLocation();
-                                if (canvasPt != null) {
-                                    m.put("canvasX", canvasPt.getX());
-                                    m.put("canvasY", canvasPt.getY());
-                                } else {
-                                    m.put("canvasX", -1);
-                                    m.put("canvasY", -1);
-                                }
-
-                                // Clickbox if available (GameObject only); ignore errors
-                                try {
-                                    if (to instanceof GameObject) {
-                                        Rectangle r = ((GameObject) to).getClickbox().getBounds();
-                                        Map<String, Integer> cb = new HashMap<>();
-                                        cb.put("x", r.x);
-                                        cb.put("y", r.y);
-                                        cb.put("width", r.width);
-                                        cb.put("height", r.height);
-                                        m.put("clickbox", cb);
-                                    } else {
-                                        m.put("clickbox", null);
-                                    }
-                                } catch (Exception e) {
-                                    m.put("clickbox", null);
-                                }
-
-                                geBooths.add(m);
-                            }
-                        };
-
-                        // Game objects (most interactables, incl. GE booth)
-                        GameObject[] gos = tile.getGameObjects();
-                        if (gos != null) for (GameObject go : gos) check.accept(go);
-
-                        // Walls / deco / ground (just in case)
-                        check.accept(tile.getWallObject());
-                        check.accept(tile.getDecorativeObject());
-                        check.accept(tile.getGroundObject());
-                    }
-                }
-            }
-
-            data.put("ge_booths", geBooths);
-            // === END: GE booth scan ===
+            data.put("closestGameObjects", buildClosestObjects(bag));
+            data.put("ge_booths",          buildGEBoothsFromBag(bag));
 
             // ---- Grand Exchange widgets/state ----
             Map<String, Object> ge = new HashMap<>();
@@ -575,6 +439,113 @@ public class StateExporter2Plugin extends Plugin
 
             ge.put("widgets", geWidgets);
             data.put("grand_exchange", ge);
+
+            // ---- ChatLeft & ChatMenu (visible-only) ----
+            try {
+                // ChatLeft trio: NAME (text), CONTINUE (exists), TEXT (text)
+                Map<String, Object> chatLeft = new HashMap<>();
+
+                Widget wChatName = client.getWidget(15138820);   // ChatLeft.NAME
+                boolean nameExists = (wChatName != null && !wChatName.isHidden());
+                Map<String, Object> jlName = new HashMap<>();
+                jlName.put("exists", nameExists);
+                if (nameExists) jlName.put("text", safeText(wChatName));
+                chatLeft.put("name", jlName);
+
+                Widget wChatContinue = client.getWidget(15138821); // ChatLeft.CONTINUE
+                Map<String, Object> jlContinue = new HashMap<>();
+                jlContinue.put("exists", (wChatContinue != null && !wChatContinue.isHidden()));
+                chatLeft.put("continue", jlContinue);
+
+                Widget wChatText = client.getWidget(15138822);    // ChatLeft.TEXT
+                boolean textExists = (wChatText != null && !wChatText.isHidden());
+                Map<String, Object> jlText = new HashMap<>();
+                jlText.put("exists", textExists);
+                if (textExists) jlText.put("text", safeText(wChatText));
+                chatLeft.put("text", jlText);
+
+                data.put("chatLeft", chatLeft);
+
+                // Chatmenu.OPTIONS parent + visible child option texts (any count)
+                Map<String, Object> chatMenu = new HashMap<>();
+                Map<String, Object> options = new HashMap<>();
+
+                Widget wOptions = client.getWidget(14352385);     // Chatmenu.OPTIONS
+                boolean optionsExist = (wOptions != null && !wOptions.isHidden());
+                options.put("exists", optionsExist);
+
+                if (optionsExist) {
+                    List<String> texts = new ArrayList<>();
+                    Widget[] kids = wOptions.getChildren();
+                    if (kids != null) {
+                        for (Widget c : kids) {
+                            if (c == null || c.isHidden()) continue;
+                            String t = safeText(c);
+                            if (t != null) {
+                                String s = t.trim();
+                                if (!s.isEmpty()) {
+                                    texts.add(s);
+                                }
+                            }
+                        }
+                    }
+                    options.put("texts", texts);
+                }
+
+                chatMenu.put("options", options);
+                data.put("chatMenu", chatMenu);
+            } catch (Exception ignored) {
+                // keep payload shape stable on any failure
+                Map<String, Object> chatLeft = new HashMap<>();
+                chatLeft.put("name",     new HashMap<String, Object>() {{ put("exists", false); }});
+                chatLeft.put("continue", new HashMap<String, Object>() {{ put("exists", false); }});
+                chatLeft.put("text",     new HashMap<String, Object>() {{ put("exists", false); }});
+                data.put("chatLeft", chatLeft);
+
+                Map<String, Object> chatMenu = new HashMap<>();
+                chatMenu.put("options", new HashMap<String, Object>() {{
+                    put("exists", false);
+                    put("texts", new ArrayList<String>());
+                }});
+                data.put("chatMenu", chatMenu);
+            }
+
+            // ChatRight (player dialogue) — visible-only, mirrors ChatLeft shape
+            Map<String, Object> chatRight = new HashMap<>();
+
+            Widget wPlayerName = client.getWidget(14221316);
+            boolean prNameExists = (wPlayerName != null && !wPlayerName.isHidden());
+            Map<String, Object> prName = new HashMap<>();
+            prName.put("exists", prNameExists);
+            if (prNameExists) prName.put("text", safeText(wPlayerName));
+            chatRight.put("name", prName);
+
+            Widget wPlayerContinue = client.getWidget(14221317);
+            Map<String, Object> prContinue = new HashMap<>();
+            prContinue.put("exists", (wPlayerContinue != null && !wPlayerContinue.isHidden()));
+            chatRight.put("continue", prContinue);
+
+            Widget wPlayerText = client.getWidget(14221318);
+            boolean prTextExists = (wPlayerText != null && !wPlayerText.isHidden());
+            Map<String, Object> prText = new HashMap<>();
+            prText.put("exists", prTextExists);
+            if (prTextExists) prText.put("text", safeText(wPlayerText));
+            chatRight.put("text", prText);
+
+            data.put("chatRight", chatRight);
+
+            // ---- Quests: state for every quest ----
+            try {
+                Map<String, Object> quests = new HashMap<>();
+                for (Quest q : Quest.values()) {
+                    QuestState st = q.getState(client);
+                    quests.put(q.getName(), (st != null ? st.name() : null)); // e.g., NOT_STARTED / IN_PROGRESS / FINISHED
+                }
+                data.put("quests", quests);
+            } catch (Exception ignored) {
+                data.put("quests", new HashMap<String, Object>());
+            }
+
 
             // ---- GE "inventory" panel (appears while GE is open) ----
             // Parent container for items shown while GE is open: 30605312
@@ -648,7 +619,7 @@ public class StateExporter2Plugin extends Plugin
                 }
             }
             data.put("menuEntries", menuInfo);
-            
+
            // ---- Bank export ----
             Map<String, Object> bank = new HashMap<>();
 
@@ -743,22 +714,146 @@ public class StateExporter2Plugin extends Plugin
 
             // ---- Bank control widgets (withdraw as note / quantity all) ----
             try {
-                Widget wNoteToggle = client.getWidget(786458);   // "Withdraw as note"
-                Widget wQtyAll     = client.getWidget(786470);   // "Quantity: All"
-
                 Map<String, Object> bankWidgets = new HashMap<>();
-                bankWidgets.put("withdraw_note_toggle", widgetBoundsJson(wNoteToggle));
-                bankWidgets.put("withdraw_quantity_all", widgetBoundsJson(wQtyAll));
 
+                // Helpers (local only)
+                java.util.function.Function<Widget, Map<String, Object>> flatBounds = (w) -> {
+                    Map<String, Object> bj = widgetBoundsJson(w);
+                    if (bj == null) return null;
+                    Object inner = bj.get("bounds");
+                    // If widgetBoundsJson returned {"bounds": {...}}, unwrap it; otherwise keep as-is
+                    if (inner instanceof Map) return (Map<String, Object>) inner;
+                    return bj; // already a flat bounds map
+                };
+                java.util.function.Function<Widget, Boolean> isSelected = (w) -> {
+                    try {
+                        if (w == null) return false;
+                        // Unified rule everywhere: null onOpListener => selected
+                        return w.getOnOpListener() == null;
+                    } catch (Exception ignored) { return false; }
+                };
+                java.util.function.BiFunction<Integer, String, Map<String, Object>> packToggle = (id, key) -> {
+                    Widget w = client.getWidget(id);
+                    Map<String, Object> m = new HashMap<>();
+                    m.put("bounds", flatBounds.apply(w));       // <- FLAT bounds
+                    m.put("selected", isSelected.apply(w));     // <- unified selection logic
+                    bankWidgets.put(key, m);
+                    return m;
+                };
+
+                // ---- Withdraw ITEM (786456) & NOTE (786458) toggles ----
+                packToggle.apply(786456, "withdraw_item_toggle");
+                packToggle.apply(786458, "withdraw_note_toggle");
+
+                // ---- Quantity quick buttons: 1/5/10/X/All ----
+                packToggle.apply(786462, "withdraw_quantity_1");   // 1
+                packToggle.apply(786464, "withdraw_quantity_5");   // 5
+                packToggle.apply(786466, "withdraw_quantity_10");  // 10
+                packToggle.apply(786468, "withdraw_quantity_X");   // X
+                packToggle.apply(786470, "withdraw_quantity_all"); // All
+
+                // ---- Deposit inventory button (786476) ----
+                Widget wDepositInv = client.getWidget(786476);
+                bankWidgets.put("deposit_inventory", widgetBoundsJson(wDepositInv));
+
+
+                // ---- Bank quantity layer (786460) with detailed options (flattened bounds) ----
+                Widget qtyLayer = client.getWidget(786460);
+                Map<String, Object> qtyJson = new HashMap<>();
+                qtyJson.put("parentId", 786460);
+
+                List<Map<String, Object>> options = new ArrayList<>();
+
+                java.util.function.Predicate<Map<String, Object>> hasPositiveBounds = (bj) -> {
+                    if (bj == null) return false;
+                    Number w = (Number) bj.get("width");
+                    Number h = (Number) bj.get("height");
+                    return w != null && h != null && w.intValue() > 0 && h.intValue() > 0;
+                };
+
+                if (qtyLayer != null && !qtyLayer.isHidden() && qtyLayer.getChildren() != null) {
+                    Widget[] kids = qtyLayer.getChildren();
+
+                    // Children typically in PAIRS (label + indicator). First layer only.
+                    for (int i = 0; i + 1 < kids.length; i += 2) {
+                        Widget a = kids[i];
+                        Widget b = kids[i + 1];
+                        if (a == null || b == null) continue;
+                        if (a.isHidden() || b.isHidden()) continue;
+
+                        Map<String, Object> aB = flatBounds.apply(a);
+                        Map<String, Object> bB = flatBounds.apply(b);
+                        boolean aOk = hasPositiveBounds.test(aB);
+                        boolean bOk = hasPositiveBounds.test(bB);
+                        if (!aOk && !bOk) continue;
+
+                        String aTxt = safeText(a);
+                        String bTxt = safeText(b);
+
+                        Widget labelW, indicatorW;
+                        Map<String, Object> labelBounds;
+
+                        if (aTxt != null && !aTxt.isEmpty()) {
+                            labelW = a; indicatorW = b; labelBounds = aB;
+                        } else if (bTxt != null && !bTxt.isEmpty()) {
+                            labelW = b; indicatorW = a; labelBounds = bB;
+                        } else {
+                            if (aOk) { labelW = a; indicatorW = b; labelBounds = aB; }
+                            else     { labelW = b; indicatorW = a; labelBounds = bB; }
+                        }
+
+                        boolean selected = isSelected.apply(indicatorW);
+
+                        List<Object> onOpDump = null;
+                        try {
+                            Object[] onOp = indicatorW.getOnOpListener();
+                            if (onOp != null) {
+                                onOpDump = new ArrayList<>(onOp.length);
+                                for (Object o : onOp) onOpDump.add(o);
+                            }
+                        } catch (Exception ignored) {}
+
+                        Map<String, Object> opt = new HashMap<>();
+                        opt.put("text", safeText(labelW));     // "1", "5", "10", "X", "All"
+                        opt.put("selected", selected);
+                        opt.put("bounds", labelBounds);        // <- FLAT bounds for the clickable label
+                        opt.put("textChildId", labelW.getId());
+                        opt.put("indicatorChildId", indicatorW.getId());
+                        opt.put("indicatorOnOpListener", onOpDump);
+
+                        options.add(opt);
+                    }
+                }
+
+                qtyJson.put("options", options);
+                bankWidgets.put("withdraw_quantity_layer", qtyJson);
+
+                // Commit bundle
                 data.put("bank_widgets", bankWidgets);
+
             } catch (Exception e) {
-                // Keep JSON stable even if widgets are missing
+                // Stable fallback (all flat/nullable)
                 Map<String, Object> bankWidgets = new HashMap<>();
-                bankWidgets.put("withdraw_note_toggle", null);
-                bankWidgets.put("withdraw_quantity_all", null);
+                java.util.function.Supplier<Map<String, Object>> emptyToggle = () -> new HashMap<String, Object>() {{
+                    put("bounds", null);
+                    put("selected", false);
+                }};
+                bankWidgets.put("withdraw_item_toggle", emptyToggle.get());
+                bankWidgets.put("withdraw_note_toggle", emptyToggle.get());
+                bankWidgets.put("withdraw_quantity_1", emptyToggle.get());
+                bankWidgets.put("withdraw_quantity_5", emptyToggle.get());
+                bankWidgets.put("withdraw_quantity_10", emptyToggle.get());
+                bankWidgets.put("withdraw_quantity_X", emptyToggle.get());
+                bankWidgets.put("withdraw_quantity_all", emptyToggle.get());
+                bankWidgets.put("deposit_inventory", new HashMap<String, Object>() {{
+                    put("bounds", null);
+                }});
+                bankWidgets.put("withdraw_quantity_layer", new HashMap<String, Object>() {{
+                    put("parentId", 786460);
+                    put("options", new ArrayList<Map<String, Object>>());
+                }});
                 data.put("bank_widgets", bankWidgets);
             }
-
 
             // Inventory detailed slot information
             Map<String, Object> inventoryInfo = new HashMap<>();
@@ -840,6 +935,20 @@ public class StateExporter2Plugin extends Plugin
 
             data.put("tiles_15x15", collectTiles15x15());
 
+            // inside extractGameData(), near other top-level fields:
+            try {
+                Map<String, Object> skills = new HashMap<>();
+                skills.put("craftingLevel", client.getRealSkillLevel(Skill.CRAFTING));
+                skills.put("craftingXP",    client.getSkillExperience(Skill.CRAFTING));
+                data.put("skills", skills);
+            } catch (Exception ignored) {
+                // keep payload shape stable
+                Map<String, Object> skills = new HashMap<>();
+                skills.put("craftingLevel", null);
+                skills.put("craftingXP", null);
+                data.put("skills", skills);
+            }
+
             // ---- Crafting widgets: export bounds (or null if missing)
             Widget wCrafting = client.getWidget(WIDGET_CRAFTING_INTERFACE);
             Widget wMakeSapphireRing = client.getWidget(WIDGET_MAKE_SAPPHIRE_RINGS);
@@ -855,19 +964,19 @@ public class StateExporter2Plugin extends Plugin
              // Crafting interface status - simplified check
              boolean craftingInterfaceOpen = (wCrafting != null);
              data.put("craftingInterfaceOpen", craftingInterfaceOpen);
-            
+
             // Last interaction data
             if (lastInteraction != null) {
                 data.put("lastInteraction", lastInteraction);
             }
-            
+
         }
         catch (Exception e)
         {
             log.error("Error extracting game data: {}", e.getMessage());
             data.put("error", e.getMessage());
         }
-        
+
         return data;
     }
 
@@ -877,7 +986,7 @@ public class StateExporter2Plugin extends Plugin
     private List<Map<String, Object>> getClosestNPCs()
     {
         List<Map<String, Object>> npcList = new ArrayList<>();
-        
+
         try
         {
             Player localPlayer = client.getLocalPlayer();
@@ -885,10 +994,10 @@ public class StateExporter2Plugin extends Plugin
             {
                 return npcList;
             }
-            
+
             WorldPoint playerPos = localPlayer.getWorldLocation();
             List<String> prioritizedNames = getPrioritizedNames(config.prioritizedNPCs());
-            
+
             // Get all NPCs and calculate distances
             List<NPC> allNPCs = new ArrayList<>();
             for (NPC npc : client.getNpcs())
@@ -898,18 +1007,18 @@ public class StateExporter2Plugin extends Plugin
                     allNPCs.add(npc);
                 }
             }
-            
+
             // Sort by distance to player
             allNPCs.sort((npc1, npc2) -> {
                 WorldPoint pos1 = npc1.getWorldLocation();
                 WorldPoint pos2 = npc2.getWorldLocation();
-                
+
                 double dist1 = playerPos.distanceTo(pos1);
                 double dist2 = playerPos.distanceTo(pos2);
-                
+
                 return Double.compare(dist1, dist2);
             });
-            
+
             // Add prioritized NPCs first
             for (NPC npc : allNPCs)
             {
@@ -918,7 +1027,7 @@ public class StateExporter2Plugin extends Plugin
                     npcList.add(createNPCInfo(npc, playerPos));
                 }
             }
-            
+
             // Add remaining closest NPCs
             for (NPC npc : allNPCs)
             {
@@ -932,113 +1041,124 @@ public class StateExporter2Plugin extends Plugin
         {
             log.error("Error getting closest NPCs: {}", e.getMessage());
         }
-        
+
         return npcList;
     }
-    
+
     /**
      * Get the closest Game Objects based on configuration
      */
     private List<Map<String, Object>> getClosestGameObjects()
     {
-        List<Map<String, Object>> objectList = new ArrayList<>();
-        
-        try
-        {
-            Player localPlayer = client.getLocalPlayer();
-            if (localPlayer == null)
-            {
-                return objectList;
-            }
-            
-            WorldPoint playerPos = localPlayer.getWorldLocation();
-            List<String> prioritizedNames = getPrioritizedNames(config.prioritizedGameObjects());
-            
-            // Get all game objects and calculate distances
-            List<GameObject> allObjects = new ArrayList<>();
-            for (int x = 0; x < 104; x++)
-            {
-                for (int y = 0; y < 104; y++)
-                {
-                    Tile tile = client.getScene().getTiles()[client.getPlane()][x][y];
-                    if (tile != null)
-                    {
-                        GameObject[] objects = tile.getGameObjects();
-                        for (GameObject obj : objects)
-                        {
-                            if (obj != null)
-                            {
-                                try
-                                {
-                                    ObjectComposition objDef = client.getObjectDefinition(obj.getId());
-                                    if (objDef != null && objDef.getName() != null && !objDef.getName().equals("null"))
-                                    {
-                                        allObjects.add(obj);
-                                    }
-                                }
-                                catch (Exception e)
-                                {
-                                    // Ignore objects with invalid definitions
-                                }
-                            }
+        List<Map<String, Object>> out = new ArrayList<>();
+        try {
+            Player me = client.getLocalPlayer();
+            if (me == null) return out;
+
+            WorldPoint meW = me.getWorldLocation();
+            int plane = client.getPlane();
+            Scene scene = client.getScene();
+            if (scene == null) return out;
+
+            Tile[][] tilesPlane = scene.getTiles()[plane];
+            if (tilesPlane == null) return out;
+
+            // radius & cap (make sure StateExporter2Config has objectScanRadius())
+            final int R   = Math.max(5, Math.min(30, config.objectScanRadius()));
+            final int cap = Math.max(1, config.maxGameObjects());
+
+            // prioritized names (case-sensitive match to be consistent with your other filters;
+            // switch to equalsIgnoreCase if you prefer)
+            final List<String> prioritized = getPrioritizedNames(config.prioritizedGameObjects());
+            final boolean hasPrio = !prioritized.isEmpty();
+
+            // center of scan
+            LocalPoint meL = me.getLocalLocation();
+            int cx = (meL != null) ? meL.getSceneX() : (meW.getX() - client.getBaseX());
+            int cy = (meL != null) ? meL.getSceneY() : (meW.getY() - client.getBaseY());
+
+            // collect candidates
+            List<TileObject> prioBag   = new ArrayList<>();
+            List<TileObject> otherBag  = new ArrayList<>();
+
+            for (int lx = Math.max(0, cx - R); lx <= Math.min(103, cx + R); lx++) {
+                Tile[] col = tilesPlane[lx];
+                if (col == null) continue;
+
+                for (int ly = Math.max(0, cy - R); ly <= Math.min(103, cy + R); ly++) {
+                    Tile t = col[ly];
+                    if (t == null) continue;
+
+                    // add all kinds; skip java nulls immediately
+                    TileObject[] objs = gatherTileObjects(t);
+                    if (objs == null) continue;
+
+                    for (TileObject to : objs) {
+                        if (to == null) continue;
+
+                        // Definition/name lookup — filter out “null”/empty names
+                        String nm = null;
+                        try {
+                            ObjectComposition def = client.getObjectDefinition(to.getId());
+                            nm = (def != null) ? def.getName() : null;
+                        } catch (Exception ignored) {}
+
+                        if (nm == null || nm.isEmpty() || "null".equalsIgnoreCase(nm)) {
+                            // filtered out per your requirement
+                            continue;
+                        }
+
+                        // Partition by priority (don’t cap yet)
+                        if (hasPrio && prioritized.contains(nm)) {
+                            prioBag.add(to);
+                        } else {
+                            otherBag.add(to);
                         }
                     }
                 }
             }
-            
-            // Sort by distance to player
-            allObjects.sort((obj1, obj2) -> {
-                WorldPoint pos1 = obj1.getWorldLocation();
-                WorldPoint pos2 = obj2.getWorldLocation();
-                
-                double dist1 = playerPos.distanceTo(pos1);
-                double dist2 = playerPos.distanceTo(pos2);
-                
-                return Double.compare(dist1, dist2);
-            });
-            
-            // Add prioritized objects first
-            for (GameObject obj : allObjects)
-            {
-                try
-                {
-                    ObjectComposition objDef = client.getObjectDefinition(obj.getId());
-                    if (objDef != null && prioritizedNames.contains(objDef.getName()) && objectList.size() < config.maxGameObjects())
-                    {
-                        objectList.add(createGameObjectInfo(obj, playerPos));
-                    }
-                }
-                catch (Exception e)
-                {
-                    // Ignore objects with invalid definitions
-                }
+
+            // sort each partition by distance (nearest first)
+            java.util.Comparator<TileObject> byDist = (a, b) ->
+                    Double.compare(meW.distanceTo(a.getWorldLocation()), meW.distanceTo(b.getWorldLocation()));
+            prioBag.sort(byDist);
+            otherBag.sort(byDist);
+
+            // fill output: take from prioritized first, then others, up to cap
+            for (TileObject to : prioBag) {
+                if (out.size() >= cap) break;
+                out.add(createTileObjectInfo(to, meW));
             }
-            
-            // Add remaining closest objects
-            for (GameObject obj : allObjects)
-            {
-                try
-                {
-                    ObjectComposition objDef = client.getObjectDefinition(obj.getId());
-                    if (objDef != null && !prioritizedNames.contains(objDef.getName()) && objectList.size() < config.maxGameObjects())
-                    {
-                        objectList.add(createGameObjectInfo(obj, playerPos));
-                    }
-                }
-                catch (Exception e)
-                {
-                    // Ignore objects with invalid definitions
-                }
+            for (TileObject to : otherBag) {
+                if (out.size() >= cap) break;
+                out.add(createTileObjectInfo(to, meW));
             }
-        }
-        catch (Exception e)
-        {
+        } catch (Exception e) {
             log.error("Error getting closest game objects: {}", e.getMessage());
         }
-        
-        return objectList;
+        return out;
     }
-    
+
+    /** Gather all tile object kinds into a simple array; null-safe. */
+    private static TileObject[] gatherTileObjects(Tile t) {
+        if (t == null) return null;
+        List<TileObject> all = new ArrayList<>(8);
+        WallObject w = t.getWallObject();
+        if (w != null) all.add(w);
+        DecorativeObject d = t.getDecorativeObject();
+        if (d != null) all.add(d);
+        GroundObject g = t.getGroundObject();
+        if (g != null) all.add(g);
+        GameObject[] gos = t.getGameObjects();
+        if (gos != null) {
+            for (GameObject go : gos) if (go != null) all.add(go);
+        }
+        return all.toArray(new TileObject[0]);
+    }
+
+
+
+
     /**
      * Create NPC info map
      */
@@ -1327,30 +1447,74 @@ public class StateExporter2Plugin extends Plugin
         return out;
     }
 
+    // NEW: snapshot collector (runs on client thread only)
+    private Map<String, Object> captureSnapshotSafe() {
+        try {
+            // ONLY the data read from the game must happen on client thread:
+            return extractGameData(); // unchanged logic
+        } catch (Exception e) {
+            HashMap<String,Object> m = new HashMap<>();
+            m.put("error", "snapshot-failed: " + e.getMessage());
+            return m;
+        }
+    }
+
     private void scheduleExportTask(int periodMs)
     {
-        if (executor == null)
-        {
-            return;
-        }
-        if (exportFuture != null)
-        {
-            exportFuture.cancel(true);
-            exportFuture = null;
-        }
-        if (periodMs <= 0)
-        {
+        if (executor == null) return;
+        if (exportFuture != null) { exportFuture.cancel(true); exportFuture = null; }
+        if (periodMs <= 0) {
             log.warn("exportIntervalMs <= 0 ({}). Skipping export scheduling.", periodMs);
             return;
         }
-        // Run export on the RuneLite client thread for safety
-        exportFuture = executor.scheduleAtFixedRate(
-                () -> clientThread.invoke(this::exportGamestate),
-                0L,
-                periodMs,
-                TimeUnit.MILLISECONDS
-        );
+
+        exportFuture = executor.scheduleAtFixedRate(() -> {
+            try {
+                // 1) SNAPSHOT on client thread (fast)
+                final java.util.concurrent.CompletableFuture<Map<String,Object>> snap = new java.util.concurrent.CompletableFuture<>();
+                clientThread.invoke(() -> {
+                    try { snap.complete(captureSnapshotSafe()); }
+                    catch (Throwable t) { snap.completeExceptionally(t); }
+                });
+                Map<String,Object> gameData = snap.get(1000, java.util.concurrent.TimeUnit.MILLISECONDS);
+
+                // 2) JSON + FILE I/O off-thread (we are already off client thread here)
+                Map<String,Object> gamestate = new HashMap<>();
+                gamestate.put("timestamp", System.currentTimeMillis());
+                gamestate.put("plugin", "StateExporter2");
+                gamestate.put("version", "1.0.0");
+                gamestate.put("data", gameData);
+
+                writeGamestateFile(gamestate); // new tiny helper below
+            } catch (Exception e) {
+                log.warn("export task failed: {}", e.toString());
+            }
+        }, 0L, periodMs, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
+
+    // NEW: tiny helper that only does JSON + file I/O off-thread
+    private void writeGamestateFile(Map<String,Object> gamestate) throws IOException {
+        // (1) directory
+        String gamestatesDir = config.gamestatesDirectory();
+        File dir = new File(gamestatesDir);
+        if (!dir.exists() && !dir.mkdirs()) {
+            log.error("Failed to create gamestates directory: {}", gamestatesDir);
+            return;
+        }
+        ensureRoomForOne(dir, config.maxGamestateFiles());
+
+        // (2) filename
+        File file = new File(dir, System.currentTimeMillis() + ".json");
+
+        // (3) write (no pretty printing; faster & smaller)
+        try (java.io.BufferedWriter w = new java.io.BufferedWriter(new java.io.FileWriter(file))) {
+            w.write(gson.toJson(gamestate));
+            w.write("\n");
+        }
+
+        pruneGamestateFiles(dir, config.maxGamestateFiles());
+    }
+
 
     private void ensureRoomForOne(File dir, int maxToKeep)
     {
@@ -1442,17 +1606,302 @@ public class StateExporter2Plugin extends Plugin
         return out;
     }
 
-    // Put this INSIDE the class (e.g., near other helpers)
-    private List<WorldPoint> demoPathTo(int goalX, int goalY)
+    // Treat a widget as visible only if it and its parents aren't hidden and it has >0x>0 bounds.
+    private boolean isEffectivelyVisible(Widget w)
     {
-        // TODO: implement real A* later; placeholder returns just the goal
-        Player lp = client.getLocalPlayer();
-        int plane = (lp != null) ? lp.getWorldLocation().getPlane() : 0;
-        List<WorldPoint> out = new ArrayList<>();
-        out.add(new WorldPoint(goalX, goalY, plane));
+        if (w == null) return false;
+        try {
+            Widget cur = w;
+            while (cur != null) {
+                if (cur.isHidden()) return false;
+                cur = cur.getParent();
+            }
+        } catch (Exception ignored) {}
+        // Also require positive bounds (same idea you use for GE children)
+        try {
+            Rectangle r = w.getBounds();
+            if (r == null || r.width <= 0 || r.height <= 0) return false;
+        } catch (Exception ignored) {
+            return false;
+        }
+        return true;
+    }
+
+    private void putChatWidgetIfVisible(Map<String, Object> out, int id)
+    {
+        try {
+            Widget w = client.getWidget(id);
+            if (w == null || !isEffectivelyVisible(w)) return;
+
+            Map<String, Object> jw = widgetFlatJson(w); // your existing flattener
+            if (jw == null) return;
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> b = (Map<String, Object>) jw.get("bounds");
+            if (b == null) return;
+            if (((Number)b.get("width")).intValue() <= 0 || ((Number)b.get("height")).intValue() <= 0) return;
+
+            // Ensure textStripped is present (parity with other exports)
+            Object t = jw.get("text");
+            if (t instanceof String && !jw.containsKey("textStripped")) {
+                jw.put("textStripped", ((String)t).replaceAll("<[^>]*>", ""));
+            }
+
+            out.put(String.valueOf(id), jw);
+        } catch (Exception ignored) {}
+    }
+
+    // Returns Widget.getText() safely; never throws; never null
+    private static String safeText(Widget w) {
+        if (w == null) return "";
+        try {
+            String t = w.getText();
+            return (t != null) ? t : "";
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private int bagRadius() {
+        // single knob; already requested earlier
+        return Math.max(5, Math.min(30, config.objectScanRadius()));
+    }
+
+    private ObjBag collectNearbyObjectsOnce(int R) {
+        ObjBag bag = new ObjBag();
+        Player me = client.getLocalPlayer();
+        if (me == null) return bag;
+        int plane = client.getPlane();
+        Tile[][] tiles = client.getScene().getTiles()[plane];
+        if (tiles == null) return bag;
+
+        LocalPoint meL = me.getLocalLocation();
+        int cx = meL.getSceneX(), cy = meL.getSceneY();
+
+        for (int lx = Math.max(0, cx - R); lx <= Math.min(103, cx + R); lx++) {
+            for (int ly = Math.max(0, cy - R); ly <= Math.min(103, cy + R); ly++) {
+                Tile t = tiles[lx][ly];
+                if (t == null) continue;
+                GameObject[] gos = t.getGameObjects();
+                if (gos == null) continue;
+                for (GameObject go : gos) {
+                    if (go == null) continue;
+                    bag.all.add(go);
+                }
+            }
+        }
+        return bag;
+    }
+
+    private List<Map<String,Object>> buildClosestObjects(ObjBag bag) {
+        List<Map<String,Object>> out = new ArrayList<>();
+        Player me = client.getLocalPlayer();
+        if (me == null) return out;
+
+        WorldPoint meW = me.getWorldLocation();
+        List<String> prioritized = getPrioritizedNames(config.prioritizedGameObjects());
+        boolean hasPrio = !prioritized.isEmpty();
+
+        // distance sort
+        bag.all.sort((a,b) -> Double.compare(
+                meW.distanceTo(a.getWorldLocation()),
+                meW.distanceTo(b.getWorldLocation())
+        ));
+
+        int cap = Math.max(1, config.maxGameObjects());
+
+        // prioritized first
+        if (hasPrio) {
+            for (GameObject go : bag.all) {
+                if (out.size() >= cap) break;
+                String nm = defName(bag, go.getId());
+                if (nm != null && prioritized.contains(nm)) out.add(createGameObjectInfo(go, meW));
+            }
+        }
+        // then the rest
+        for (GameObject go : bag.all) {
+            if (out.size() >= cap) break;
+            String nm = defName(bag, go.getId());
+            if (!hasPrio || nm == null || !prioritized.contains(nm)) {
+                out.add(createGameObjectInfo(go, meW));
+            }
+        }
+        return out;
+    }
+
+    private List<Map<String,Object>> buildGEBoothsFromBag(ObjBag bagIgnored) {
+        List<Map<String,Object>> out = new ArrayList<>();
+        Player me = client.getLocalPlayer();
+        if (me == null) return out;
+        WorldPoint meW = me.getWorldLocation();
+
+        final int R = Math.max(8, Math.min(30, bagRadius())); // small but reliable radius
+        List<TileObject> near = scanNearbyTileObjects(R);
+
+        // --- pass 1: prioritized names (mandatory) ---
+        List<String> prioritized = getPrioritizedNames(config.prioritizedGameObjects());
+        if (!prioritized.isEmpty()) {
+            for (TileObject to : near) {
+                String nm = null;
+                try {
+                    ObjectComposition def = client.getObjectDefinition(to.getId());
+                    nm = (def != null) ? def.getName() : null;
+                } catch (Exception ignored) {}
+                if (nm == null || nm.isEmpty() || "null".equalsIgnoreCase(nm)) continue;
+                if (prioritized.contains(nm)) {
+                    out.add(createTileObjectInfo(to, meW));
+                }
+            }
+        }
+
+        // --- pass 2: GE booth by ID or name (if not already added) ---
+        for (TileObject to : near) {
+            int id = to.getId();
+            boolean idMatch = (id == GE_BOOTH_ID_A || id == GE_BOOTH_ID_B);
+            boolean nameMatch = false;
+            if (!idMatch) {
+                String nm = null;
+                try {
+                    ObjectComposition def = client.getObjectDefinition(id);
+                    nm = (def != null) ? def.getName() : null;
+                } catch (Exception ignored) {}
+                nameMatch = nm != null && nm.equalsIgnoreCase("Grand Exchange booth");
+            }
+
+            if (idMatch || nameMatch) {
+                // avoid duplicates if prioritized pass already added it
+                // (dedupe by id + world coords)
+                Map<String,Object> info = createTileObjectInfo(to, meW);
+                boolean dup = false;
+                int wx = ((Number)info.get("worldX")).intValue();
+                int wy = ((Number)info.get("worldY")).intValue();
+                int pid = ((Number)info.get("id")).intValue();
+                for (Map<String,Object> m : out) {
+                    if (((Number)m.get("id")).intValue() == pid
+                            && ((Number)m.get("worldX")).intValue() == wx
+                            && ((Number)m.get("worldY")).intValue() == wy) {
+                        dup = true; break;
+                    }
+                }
+                if (!dup) out.add(info);
+            }
+        }
+
+        // nearest-first
+        out.sort((a,b) -> Double.compare(
+                ((Number)a.getOrDefault("distance", 9e9)).doubleValue(),
+                ((Number)b.getOrDefault("distance", 9e9)).doubleValue()
+        ));
+
         return out;
     }
 
 
+    private String defName(ObjBag bag, int id) {
+        try {
+            ObjectComposition def = bag.defs.computeIfAbsent(id, k -> client.getObjectDefinition(k));
+            if (def == null) return null;
+            String nm = def.getName();
+            return (nm == null || "null".equals(nm)) ? null : nm;
+        } catch (Exception e) { return null; }
+    }
+
+    class ObjBag {
+        final List<GameObject> all = new ArrayList<>();
+        final Map<Integer,ObjectComposition> defs = new HashMap<>();
+    }
+
+    private List<TileObject> scanNearbyTileObjects(int R) {
+        List<TileObject> out = new ArrayList<>();
+        Player me = client.getLocalPlayer();
+        if (me == null) return out;
+        int plane = client.getPlane();
+        Tile[][] tiles = client.getScene().getTiles()[plane];
+        if (tiles == null) return out;
+
+        LocalPoint meL = me.getLocalLocation();
+        int cx = meL.getSceneX(), cy = meL.getSceneY();
+
+        for (int lx = Math.max(0, cx - R); lx <= Math.min(103, cx + R); lx++) {
+            Tile[] col = tiles[lx];
+            if (col == null) continue;
+            for (int ly = Math.max(0, cy - R); ly <= Math.min(103, cy + R); ly++) {
+                Tile t = col[ly];
+                if (t == null) continue;
+
+                // collect ALL kinds
+                WallObject w = t.getWallObject();
+                if (w != null) out.add(w);
+                DecorativeObject d = t.getDecorativeObject();
+                if (d != null) out.add(d);
+                GroundObject g = t.getGroundObject();
+                if (g != null) out.add(g);
+                GameObject[] gos = t.getGameObjects();
+                if (gos != null) for (GameObject go : gos) if (go != null) out.add(go);
+            }
+        }
+        return out;
+    }
+
+    private static boolean nameLike(String s, String... subs) {
+        if (s == null) return false;
+        String n = s.toLowerCase();
+        if (n.isEmpty() || "null".equals(n)) return false;
+        for (String sub : subs) {
+            if (n.contains(sub)) return true;
+        }
+        return false;
+    }
+
+    private static String[] safeActions(ObjectComposition def) {
+        try {
+            String[] a = def.getActions();
+            if (a == null) return new String[0];
+            return a;
+        } catch (Exception e) {
+            return new String[0];
+        }
+    }
+
+    private Map<String, Object> packWorldObject(GameObject obj) {
+        Map<String, Object> m = new HashMap<>();
+        m.put("id", obj.getId());
+        try {
+            ObjectComposition def = client.getObjectDefinition(obj.getId());
+            m.put("name", def.getName());
+            m.put("actions", safeActions(def));
+        } catch (Exception e) {
+            m.put("name", "Unknown");
+            m.put("actions", new String[0]);
+        }
+        WorldPoint wp = obj.getWorldLocation();
+        m.put("worldX", wp.getX());
+        m.put("worldY", wp.getY());
+        m.put("plane",  wp.getPlane());
+        m.put("canvasX", obj.getCanvasLocation().getX());
+        m.put("canvasY", obj.getCanvasLocation().getY());
+        // distance if you already store it elsewhere, otherwise compute from local player
+        try {
+            Player me = client.getLocalPlayer();
+            WorldPoint meWp = me.getWorldLocation();
+            int dx = Math.abs(meWp.getX() - wp.getX());
+            int dy = Math.abs(meWp.getY() - wp.getY());
+            m.put("distance", Math.max(dx, dy));
+        } catch (Exception ignored) {}
+        try {
+            Rectangle r = obj.getClickbox() != null ? obj.getClickbox().getBounds() : null;
+            if (r != null) {
+                Map<String, Object> cb = new HashMap<>();
+                cb.put("x", r.x); cb.put("y", r.y);
+                cb.put("width", r.width); cb.put("height", r.height);
+                m.put("clickbox", cb);
+            } else {
+                m.put("clickbox", null);
+            }
+        } catch (Exception e) {
+            m.put("clickbox", null);
+        }
+        return m;
+    }
 
 }
