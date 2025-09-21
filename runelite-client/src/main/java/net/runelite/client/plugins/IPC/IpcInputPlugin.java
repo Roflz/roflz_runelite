@@ -136,6 +136,17 @@ public class IpcInputPlugin extends Plugin
         private volatile boolean running = true;
         private ServerSocket server;
 
+        // Add near the top of ServerThread (helpers)
+        private static String safeSnippet(String s, int max) {
+            if (s == null) return null;
+            s = s.replace("\n", "\\n").replace("\r", "\\r");
+            return (s.length() <= max) ? s : s.substring(0, max) + "...";
+        }
+        private static String safeMsg(Throwable t) {
+            return (t == null || t.getMessage() == null) ? t.toString() : t.getMessage();
+        }
+
+
         // --- BEGIN DEBUG STRUCTS ---
         // Put this inside IpcInputPlugin.ServerThread (replace your existing PathDebug)
         private static final class PathDebug
@@ -248,35 +259,50 @@ public class IpcInputPlugin extends Plugin
                          PrintWriter out = new PrintWriter(new OutputStreamWriter(s.getOutputStream(), "UTF-8"), true))
                     {
                         final String line = in.readLine();
-                        if (line == null)
-                        {
-                            out.println("{\"ok\":false,\"err\":\"empty\"}");
+                        if (line == null) {
+                            out.println("{\"ok\":false,\"err\":\"empty-line\"}");
+                            continue;
+                        }
+                        log.info("[IPC] recv raw: {}", safeSnippet(line, 256));
+
+                        final Cmd cmd;
+                        try {
+                            cmd = gson.fromJson(line.trim(), Cmd.class);
+                        } catch (Exception parseEx) {
+                            out.println("{\"ok\":false,\"err\":\"bad-json\",\"detail\":\""
+                                    + safeSnippet(safeMsg(parseEx), 160) + "\",\"raw\":\""
+                                    + safeSnippet(line, 200) + "\"}");
+                            continue;
+                        }
+                        if (cmd == null || cmd.cmd == null) {
+                            out.println("{\"ok\":false,\"err\":\"missing-cmd\"}");
                             continue;
                         }
 
-//                        log.info("[IPC] recv: {}", line);
-                        Cmd cmd;
-                        try
-                        {
-                            cmd = gson.fromJson(line.trim(), Cmd.class);
-                        }
-                        catch (Exception e)
-                        {
-                            out.println("{\"ok\":false,\"err\":\"bad-json\"}");
-                            continue;
-                        }
-                        if (cmd == null || cmd.cmd == null)
-                        {
-                            out.println("{\"ok\":false,\"err\":\"bad-request\"}");
-                            continue;
-                        }
 //                        log.info("[IPC] cmd={}", cmd.cmd);
 
                         switch (cmd.cmd)
                         {
-                            case "ping":
-                                out.println("{\"ok\":true,\"pong\":true}");
+                            case "ping": {
+                                final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                resp.put("ok", true);
+                                resp.put("ts", System.currentTimeMillis());
+                                try { resp.put("plane", client.getPlane()); } catch (Throwable ignored) {}
+                                try {
+                                    if (client.getLocalPlayer() != null) {
+                                        resp.put("player", java.util.Map.of(
+                                                "x", client.getLocalPlayer().getWorldLocation().getX(),
+                                                "y", client.getLocalPlayer().getWorldLocation().getY(),
+                                                "p", client.getLocalPlayer().getWorldLocation().getPlane()
+                                        ));
+                                    }
+                                } catch (Throwable ignored) {}
+                                // Advertise supported cmds to help you spot version skew
+                                resp.put("cmds", new String[]{"ping","click","scroll","path","project","objects"});
+                                out.println(gson.toJson(resp));
                                 break;
+                            }
+
 
                             case "port":
                                 out.println("{\"ok\":true,\"port\":" + port + "}");
@@ -375,6 +401,103 @@ public class IpcInputPlugin extends Plugin
                                 break;
                             }
 
+                            case "get-var": {
+                                if (cmd.id == null) { out.println("{\"ok\":false,\"err\":\"need id\"}"); break; }
+
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> r = new java.util.LinkedHashMap<>();
+                                    try {
+                                        int value = client.getVarbitValue(cmd.id);
+                                        r.put("ok", true);
+                                        r.put("id", cmd.id);
+                                        r.put("value", value);
+                                    } catch (Throwable t) {
+                                        r.put("ok", false);
+                                        r.put("err", "get-var-failed");
+                                    } finally {
+                                        fut.complete(r);
+                                    }
+                                });
+
+                                java.util.Map<String,Object> resp;
+                                try {
+                                    resp = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    resp = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(resp));
+                                break;
+                            }
+
+
+                            case "menu": {
+                                // Snapshot on client thread so geometry & entries are consistent
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> r = new java.util.LinkedHashMap<>();
+                                    try {
+                                        int x = client.getMenuX();
+                                        int y = client.getMenuY();
+                                        int w = client.getMenuWidth();
+                                        int h = client.getMenuHeight();
+                                        net.runelite.api.MenuEntry[] es = client.getMenuEntries();
+
+                                        boolean open = w > 0 && h > 0 && es != null && es.length > 0;
+                                        r.put("ok", true);
+                                        r.put("open", open);
+                                        r.put("x", x);
+                                        r.put("y", y);
+                                        r.put("w", w);
+                                        r.put("h", h);
+
+                                        // Heuristic: header ~19px; rowH already computed
+                                        final int HEADER = 19;
+                                        int rowH = !open ? 0 : Math.max(12, (h - HEADER) / es.length);
+
+                                        java.util.List<java.util.Map<String,Object>> outMenu = new java.util.ArrayList<>();
+                                        if (open) {
+                                            for (int i = 0; i < es.length; i++) {
+                                                net.runelite.api.MenuEntry me = es[i];
+
+                                                // entries[] is bottom->top; UI draws top->bottom
+                                                final int visualIndex = (es.length - 1 - i); // 0 = top visible row
+                                                final int rx = x;
+                                                final int ry = y + HEADER + visualIndex * rowH;
+
+                                                java.util.Map<String,Object> row = new java.util.LinkedHashMap<>();
+                                                row.put("index", i);               // array index (bottom->top)
+                                                row.put("visualIndex", visualIndex); // drawn row (top->bottom)
+                                                row.put("option", me.getOption());
+                                                row.put("target", me.getTarget());
+                                                row.put("type", String.valueOf(me.getType()));
+                                                row.put("identifier", me.getIdentifier());
+                                                row.put("rect", java.util.Map.of("x", rx, "y", ry, "w", w, "h", rowH));
+
+                                                outMenu.add(row);
+                                            }
+                                        }
+                                        r.put("entries", outMenu);
+                                    } catch (Throwable t) {
+                                        r.clear();
+                                        r.put("ok", false);
+                                        r.put("err", "menu-snapshot-failed");
+                                    } finally {
+                                        fut.complete(r);
+                                    }
+                                });
+
+                                java.util.Map<String,Object> resp;
+                                try { resp = fut.get(120, java.util.concurrent.TimeUnit.MILLISECONDS); }
+                                catch (Exception e) { resp = java.util.Map.of("ok", false, "err", "timeout"); }
+                                out.println(gson.toJson(resp));
+                                break;
+                            }
+
                             case "key": {
                                 if (cmd.k == null || cmd.k.isEmpty()) { out.println("{\"ok\":false,\"err\":\"need k\"}"); break; }
                                 final String mode = config.mode().trim().toUpperCase();
@@ -465,7 +588,6 @@ public class IpcInputPlugin extends Plugin
 
                             case "type": {
                                 final String text = (cmd.text == null) ? "" : cmd.text;
-                                final boolean pressEnter = cmd.enter != null && cmd.enter;
                                 final int perCharMs = (cmd.perCharMs == null) ? 25 : Math.max(0, cmd.perCharMs);
                                 final String mode = config.mode().trim().toUpperCase();
 
@@ -475,7 +597,7 @@ public class IpcInputPlugin extends Plugin
 
                                 new Thread(() -> {
                                     try {
-                                        typeStringAWT(client, text, pressEnter, perCharMs);
+                                        typeStringAWT(client, text, perCharMs);
                                     } catch (Throwable th) {
                                         log.warn("[IPC] type command failed: {}", th.toString());
                                     }
@@ -502,19 +624,142 @@ public class IpcInputPlugin extends Plugin
                             }
 
                             case "objects": {
-                                final String q = (cmd.objName == null) ? "" : cmd.objName.trim();
-                                if (q.isEmpty()) { out.println("{\"ok\":false,\"err\":\"need name\"}"); break; }
+                                final String needle = (cmd.name == null ? "" : cmd.name.trim().toLowerCase());
+                                final int radius = (cmd.radius == null) ? 26 : Math.max(1, cmd.radius);
 
-                                final java.util.Set<String> typeSet = new java.util.HashSet<>();
+                                // which object kinds to include
+                                final java.util.Set<String> kinds = new java.util.HashSet<>();
                                 if (cmd.types != null) {
-                                    for (String t : cmd.types) if (t != null) typeSet.add(t.toUpperCase());
-                                } else {
-                                    typeSet.add("WALL"); typeSet.add("GAME"); typeSet.add("DECOR");
+                                    for (String t : cmd.types) if (t != null) kinds.add(t.trim().toUpperCase());
                                 }
-                                final int radius = (cmd.radius == null) ? 22 : Math.max(1, Math.min(52, cmd.radius));
+                                if (kinds.isEmpty()) {
+                                    kinds.add("GAME");
+                                    kinds.add("WALL");
+                                    kinds.add("DECOR");
+                                    kinds.add("GROUND");
+                                }
 
-                                final java.util.Map<String,Object> resp = getObjectsOnClientThread(q, typeSet, radius, 120);
-                                out.println(gson.toJson(resp));
+                                final java.util.concurrent.CompletableFuture<java.util.List<java.util.Map<String,Object>>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.List<java.util.Map<String,Object>> objsOut = new java.util.ArrayList<>();
+                                    try {
+                                        final Player me = client.getLocalPlayer();
+                                        final Scene scene = client.getScene();
+                                        if (me == null || scene == null) { fut.complete(objsOut); return; }
+
+                                        final int plane = client.getPlane();
+                                        final int baseX = client.getBaseX(), baseY = client.getBaseY();
+                                        final int myWx = me.getWorldLocation().getX();
+                                        final int myWy = me.getWorldLocation().getY();
+                                        final int minWx = myWx - radius, maxWx = myWx + radius;
+                                        final int minWy = myWy - radius, maxWy = myWy + radius;
+
+                                        final Tile[][][] tiles = scene.getTiles();
+                                        if (tiles == null || plane < 0 || plane >= tiles.length || tiles[plane] == null) {
+                                            fut.complete(objsOut); return;
+                                        }
+
+                                        // helper: add one RuneLite object to the list if it matches
+                                        java.util.function.BiConsumer<String, TileObject> addObj = (kind, obj) -> {
+                                            if (obj == null) return;
+                                            final int id = obj.getId();
+                                            final ObjectComposition comp = client.getObjectDefinition(id);
+                                            final String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
+                                            final String nmLower = nm.toLowerCase();
+                                            if (!needle.isEmpty() && !nmLower.contains(needle)) return;
+
+                                            // world coords from local
+                                            final int wx = baseX + obj.getLocalLocation().getSceneX();
+                                            final int wy = baseY + obj.getLocalLocation().getSceneY();
+                                            if (wx < minWx || wx > maxWx || wy < minWy || wy > maxWy) return;
+
+                                            final java.util.Map<String,Object> row = new java.util.LinkedHashMap<>();
+                                            row.put("type", kind);
+                                            row.put("id", id);
+                                            row.put("name", nm);
+                                            row.put("actions", (comp != null) ? comp.getActions() : null);
+                                            row.put("world", java.util.Map.of("x", wx, "y", wy, "p", plane));
+                                            row.put("distance", Math.abs(wx - myWx) + Math.abs(wy - myWy));
+
+                                            // convex hull bounds + orientation + canvas fallback
+                                            try {
+                                                final java.awt.Shape hull =
+                                                        (obj instanceof net.runelite.api.GameObject) ? ((net.runelite.api.GameObject)obj).getConvexHull()
+                                                                : (obj instanceof net.runelite.api.DecorativeObject) ? ((net.runelite.api.DecorativeObject)obj).getConvexHull()
+                                                                : (obj instanceof net.runelite.api.WallObject) ? ((net.runelite.api.WallObject)obj).getConvexHull()
+                                                                : (obj instanceof net.runelite.api.GroundObject) ? ((net.runelite.api.GroundObject)obj).getConvexHull()
+                                                                : null;
+                                                if (hull != null) {
+                                                    final java.awt.Rectangle rb = hull.getBounds();
+                                                    if (rb != null) {
+                                                        row.put("bounds", java.util.Map.of(
+                                                                "x", rb.x, "y", rb.y, "width", rb.width, "height", rb.height));
+                                                        row.put("canvas", java.util.Map.of(
+                                                                "x", rb.x + rb.width/2, "y", rb.y + rb.height/2));
+                                                        row.put("orientation", (rb.width > rb.height) ? "horizontal" : "vertical");
+                                                    }
+                                                }
+                                            } catch (Exception ignored) {}
+
+                                            try {
+                                                final LocalPoint lp = LocalPoint.fromWorld(client, wx, wy);
+                                                if (lp != null) {
+                                                    final net.runelite.api.Point pt = Perspective.localToCanvas(client, lp, plane);
+                                                    if (pt != null) row.put("tileCanvas", java.util.Map.of("x", pt.getX(), "y", pt.getY()));
+                                                }
+                                            } catch (Exception ignored) {}
+
+                                            objsOut.add(row);
+                                        };
+
+                                        // iterate the scene within our radius window
+                                        final int minLx = Math.max(0, minWx - baseX), maxLx = Math.min(103, maxWx - baseX);
+                                        final int minLy = Math.max(0, minWy - baseY), maxLy = Math.min(103, maxWy - baseY);
+                                        for (int lx = minLx; lx <= maxLx; lx++) {
+                                            for (int ly = minLy; ly <= maxLy; ly++) {
+                                                final Tile t = tiles[plane][lx][ly];
+                                                if (t == null) continue;
+
+                                                if (kinds.contains("WALL"))  addObj.accept("WALL",  t.getWallObject());
+                                                if (kinds.contains("DECOR")) addObj.accept("DECOR", t.getDecorativeObject());
+                                                if (kinds.contains("GROUND")) addObj.accept("GROUND", t.getGroundObject());
+                                                if (kinds.contains("GAME")) {
+                                                    final GameObject[] arr = t.getGameObjects();
+                                                    if (arr != null) for (GameObject go : arr) addObj.accept("GAME", go);
+                                                }
+                                            }
+                                        }
+
+                                        // sort by distance, then name
+                                        objsOut.sort((a,b) -> {
+                                            int da = ((Number)a.getOrDefault("distance", 1_000_000)).intValue();
+                                            int db = ((Number)b.getOrDefault("distance", 1_000_000)).intValue();
+                                            if (da != db) return Integer.compare(da, db);
+                                            String na = String.valueOf(a.getOrDefault("name",""));
+                                            String nb = String.valueOf(b.getOrDefault("name",""));
+                                            return na.compareToIgnoreCase(nb);
+                                        });
+
+                                    } catch (Throwable ignored) {
+                                    } finally {
+                                        fut.complete(objsOut);
+                                    }
+                                });
+
+                                java.util.List<java.util.Map<String,Object>> found;
+                                try {
+                                    found = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    found = java.util.Collections.emptyList();
+                                }
+
+                                java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                resp.put("ok", true);
+                                resp.put("count", found.size());
+                                resp.put("objects", found);
+                                out.println(gson.toJson(resp)); // <-- this 'out' is the PrintWriter; now no collision
                                 break;
                             }
 
@@ -1225,17 +1470,34 @@ public class IpcInputPlugin extends Plugin
             dbg.best9x9 = dump9x9(flags, endLx, endLy);
 
             // Reconstruct path
-            ArrayList<WorldPoint> path = new ArrayList<>();
-            if (!(endLx == dbg.startLx && endLy == dbg.startLy)) {
+            final WorldPoint startWp = new WorldPoint(dbg.startLx + dbg.baseX, dbg.startLy + dbg.baseY, dbg.plane);
+            final WorldPoint endWp   = new WorldPoint(endLx        + dbg.baseX, endLy        + dbg.baseY, dbg.plane);
+
+            final ArrayList<WorldPoint> path = new ArrayList<>();
+
+            if (endLx == dbg.startLx && endLy == dbg.startLy) {
+                // Standing on the goal: return [start] so callers see the origin tile.
+                path.add(startWp);
+            } else {
+                // Reconstruct inclusively, from END back to START, then reverse.
                 int px = endLx, py = endLy;
-                while (!(px == dbg.startLx && py == dbg.startLy)) {
-                    path.add(new WorldPoint(px + dbg.baseX, py + dbg.baseY, dbg.plane));
-                    int packed = prev[px][py];
-                    int ppx = (packed >>> 16);
-                    int ppy = (packed & 0xFFFF);
-                    px = ppx; py = ppy;
+                while (true) {
+                    path.add(new WorldPoint(px + dbg.baseX, py + dbg.baseY, dbg.plane)); // include END and all intermediates
+                    if (px == dbg.startLx && py == dbg.startLy) break;
+
+                    // move to predecessor using your existing came-from data:
+                    // (replace 'prevX/prevY' with whatever you already have)
+                    final int packed = prev[px][py];
+                    final int npx = (packed >>> 16) & 0xFFFF;
+                    final int npy = (packed       ) & 0xFFFF;
+                    px = npx; py = npy;
                 }
                 java.util.Collections.reverse(path);
+
+                // Ensure START is index 0 (defensive; should already be after reverse).
+                if (path.isEmpty() || !path.get(0).equals(startWp)) {
+                    path.add(0, startWp);
+                }
             }
 
             dbg.timeMs = System.currentTimeMillis() - t0;
@@ -1304,7 +1566,6 @@ public class IpcInputPlugin extends Plugin
 
         private void typeStringAWT(Client client,
                                    String text,
-                                   boolean pressEnter,
                                    int perCharMs)
         {
             try {
@@ -1342,32 +1603,11 @@ public class IpcInputPlugin extends Plugin
                     if (perCharMs > 0) Thread.sleep(perCharMs);
                 }
 
-                if (pressEnter) {
-                    final int vkEnter = java.awt.event.KeyEvent.VK_ENTER;
-                    java.awt.EventQueue.invokeAndWait(() -> {
-                        long t = System.currentTimeMillis();
-                        c.dispatchEvent(new java.awt.event.KeyEvent(
-                                c, java.awt.event.KeyEvent.KEY_PRESSED, t, 0, vkEnter,
-                                java.awt.event.KeyEvent.CHAR_UNDEFINED
-                        ));
-                        c.dispatchEvent(new java.awt.event.KeyEvent(
-                                c, java.awt.event.KeyEvent.KEY_TYPED, t + 1, 0,
-                                java.awt.event.KeyEvent.VK_UNDEFINED, '\n'
-                        ));
-                    });
-                    Thread.sleep(10L);
-                    java.awt.EventQueue.invokeAndWait(() -> {
-                        long t = System.currentTimeMillis();
-                        c.dispatchEvent(new java.awt.event.KeyEvent(
-                                c, java.awt.event.KeyEvent.KEY_RELEASED, t, 0, vkEnter,
-                                java.awt.event.KeyEvent.CHAR_UNDEFINED
-                        ));
-                    });
-                }
             } catch (Throwable th) {
                 log.warn("[IPC] typeStringAWT error: {}", th.toString());
             }
         }
+
 
         // Batch door annotations for multiple world points on the client thread.
         // plane: use client.getPlane() for typical use. timeoutMs is total budget for the whole batch.
@@ -1704,7 +1944,6 @@ public class IpcInputPlugin extends Plugin
 
             // type
             @SerializedName("text")      String text;
-            @SerializedName("enter")     Boolean enter;
             @SerializedName("perCharMs") Integer perCharMs;
 
             // path
@@ -1731,15 +1970,17 @@ public class IpcInputPlugin extends Plugin
             @SerializedName("toY")   Integer toY;
             @SerializedName("holdMs") Integer holdMs;
 
-            // NEW: scroll
             @SerializedName("amount") Integer amount;
 
-            // inside IpcInputPlugin.ServerThread.Cmd
             @SerializedName("key") String key;   // e.g. "LEFT", "RIGHT", "esc"
             @SerializedName("ms")  Integer ms;   // hold duration in milliseconds
 
-            @SerializedName("name") String objName;     // substring, case-insensitive
             @SerializedName("types") List<String> types; // e.g. ["WALL","GAME","DECOR"]
+            @SerializedName("name")   String name;
+
+            // get-var
+            @SerializedName("id")   Integer id;    // varbit/varp id
+            @SerializedName("kind") String  kind;  // "varbit" (default) or "varp"
 
 
         }

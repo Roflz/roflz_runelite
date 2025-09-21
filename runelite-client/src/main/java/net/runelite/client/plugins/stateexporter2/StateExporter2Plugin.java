@@ -170,6 +170,33 @@ public class StateExporter2Plugin extends Plugin
         }
     }
 
+    @Subscribe
+    public void onMenuOpened(net.runelite.api.events.MenuOpened e)
+    {
+        final int x = client.getMenuX();
+        final int y = client.getMenuY();
+        final int w = client.getMenuWidth();
+        final int h = client.getMenuHeight();
+        final net.runelite.api.MenuEntry[] entries = e.getMenuEntries();
+
+        // Heuristics that match RuneLite’s menu layout
+        final int HEADER = 19; // title/top padding
+        final int count  = Math.max(1, entries.length);
+        final int rowH   = Math.max(12, (h - HEADER) / count);
+
+        // Array is bottom->top; UI draws top->bottom → flip the index
+        for (int i = 0; i < entries.length; i++)
+        {
+            final int visualIndex = (entries.length - 1 - i); // 0 = top visible row
+            final int ry = y + HEADER + visualIndex * rowH;
+
+            final var me = entries[i];
+            log.info("[MenuRow vis:{} arr:{}] {} -> '{}'  rect=({},{} {}x{})",
+                    visualIndex, i, me.getOption(), me.getTarget(), x, ry, w, rowH);
+        }
+    }
+
+
 
     @Subscribe
     public void onConfigChanged(ConfigChanged e)
@@ -508,6 +535,131 @@ public class StateExporter2Plugin extends Plugin
                     put("texts", new ArrayList<String>());
                 }});
                 data.put("chatMenu", chatMenu);
+            }
+
+            // ---- Objectbox (new): UNIVERSE (continue text) + TEXT (main body) ----
+            try {
+                // Unwrap bounds to a flat {x,y,width,height} like you do elsewhere
+                java.util.function.Function<Widget, Map<String, Object>> flatBounds = (w) -> {
+                    Map<String, Object> bj = widgetBoundsJson(w);
+                    if (bj == null) return null;
+                    Object inner = bj.get("bounds");
+                    if (inner instanceof Map) return (Map<String, Object>) inner;
+                    return bj;
+                };
+
+                // pack helper for a single widget
+                java.util.function.BiFunction<Widget, Integer, Map<String, Object>> pack = (w, id) -> {
+                    Map<String, Object> m = new HashMap<>();
+                    m.put("id", id);
+                    boolean exists = (w != null && !w.isHidden());
+                    m.put("exists", exists);
+                    if (exists) {
+                        // raw text (keeps tags) + stripped (via your helper)
+                        m.put("text", w.getText());
+                        m.put("textStripped", safeText(w));
+                        m.put("bounds", flatBounds.apply(w));
+                    } else {
+                        m.put("text", null);
+                        m.put("textStripped", null);
+                        m.put("bounds", null);
+                    }
+                    return m;
+                };
+
+                final int OBJECTBOX_UNIVERSE_ID = 12648448; // "Continue" line in Objectbox
+                final int OBJECTBOX_TEXT_ID     = 12648450; // Main body text in Objectbox
+
+                Widget wObjUniverse = client.getWidget(OBJECTBOX_UNIVERSE_ID);
+                Widget wObjText     = client.getWidget(OBJECTBOX_TEXT_ID);
+
+                Map<String, Object> objectbox = new HashMap<>();
+                objectbox.put("universe", pack.apply(wObjUniverse, OBJECTBOX_UNIVERSE_ID));
+                objectbox.put("text",     pack.apply(wObjText,     OBJECTBOX_TEXT_ID));
+
+                data.put("objectbox", objectbox);
+            } catch (Exception ignored) {
+                Map<String, Object> objectbox = new HashMap<>();
+                objectbox.put("universe", new HashMap<String, Object>() {{
+                    put("id", 12648448); put("exists", false);
+                    put("text", null); put("textStripped", null); put("bounds", null);
+                }});
+                objectbox.put("text", new HashMap<String, Object>() {{
+                    put("id", 12648450); put("exists", false);
+                    put("text", null); put("textStripped", null); put("bounds", null);
+                }});
+                data.put("objectbox", objectbox);
+            }
+
+
+            // ---- GE Buy chatbox bundle (organized, stripped names) ----
+            try {
+                // local helpers (no new class methods)
+                java.util.function.Function<Widget, Map<String, Object>> flatBounds = (w) -> {
+                    Map<String, Object> bj = widgetBoundsJson(w);
+                    if (bj == null) return null;
+                    Object inner = bj.get("bounds");
+                    if (inner instanceof Map) return (Map<String, Object>) inner;
+                    return bj;
+                };
+                java.util.function.Function<String, String> stripTags = (s) -> {
+                    if (s == null) return null;
+                    // remove <...> tags, trim spaces
+                    return s.replaceAll("<[^>]+>", "").trim();
+                };
+
+                final int MES_TEXT2_ID = 10616875;       // Chatbox.MES_TEXT2 (prompt + typed text)
+                final int MES_SCROLLCONTENTS_ID = 10616883; // Chatbox.MES_LAYER_SCROLLCONTENTS (item list)
+
+                Map<String, Object> geBuyChat = new HashMap<>();
+
+                // Prompt / input line
+                Widget wPrompt = client.getWidget(MES_TEXT2_ID);
+                Map<String, Object> prompt = new HashMap<>();
+                prompt.put("id", MES_TEXT2_ID);
+                if (wPrompt != null && !wPrompt.isHidden()) {
+                    String raw = wPrompt.getText();
+                    String stripped = stripTags.apply(raw);
+                    prompt.put("text", raw);
+                    prompt.put("textStripped", stripped);
+                    prompt.put("bounds", flatBounds.apply(wPrompt)); // {x,y,width,height}
+                } else {
+                    prompt.put("text", null);
+                    prompt.put("textStripped", null);
+                    prompt.put("bounds", null);
+                }
+                geBuyChat.put("prompt", prompt);
+
+                // Item rows (children with non-empty Name)
+                Widget wList = client.getWidget(MES_SCROLLCONTENTS_ID);
+                List<Map<String, Object>> items = new ArrayList<>();
+                if (wList != null && !wList.isHidden() && wList.getChildren() != null) {
+                    for (Widget c : wList.getChildren()) {
+                        if (c == null || c.isHidden()) continue;
+                        String nm = c.getName();
+                        if (nm != null && !nm.trim().isEmpty()) {
+                            Map<String, Object> row = new HashMap<>();
+                            row.put("id", c.getId());
+                            row.put("name", nm);                            // raw (kept for debugging)
+                            row.put("nameStripped", stripTags.apply(nm));   // clean for matching
+                            row.put("bounds", flatBounds.apply(c));
+                            items.add(row);
+                        }
+                    }
+                }
+                geBuyChat.put("items", items);
+
+                data.put("ge_buy_chatbox", geBuyChat);
+            } catch (Exception ignored) {
+                Map<String, Object> geBuyChat = new HashMap<>();
+                geBuyChat.put("prompt", new HashMap<String, Object>() {{
+                    put("id", 10616875);
+                    put("text", null);
+                    put("textStripped", null);
+                    put("bounds", null);
+                }});
+                geBuyChat.put("items", new ArrayList<Map<String, Object>>());
+                data.put("ge_buy_chatbox", geBuyChat);
             }
 
             // ChatRight (player dialogue) — visible-only, mirrors ChatLeft shape
