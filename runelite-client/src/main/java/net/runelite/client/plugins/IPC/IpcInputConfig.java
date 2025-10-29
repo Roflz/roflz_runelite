@@ -15,11 +15,6 @@ public interface IpcInputConfig extends Config
     )
     default int port()
     {
-        String p = System.getProperty("rl.ipc.port");
-        if (p != null)
-        {
-            try { return Integer.parseInt(p); } catch (NumberFormatException ignored) {}
-        }
         return 17000;
     }
 

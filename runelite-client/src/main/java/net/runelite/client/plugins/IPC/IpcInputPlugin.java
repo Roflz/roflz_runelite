@@ -1,7 +1,8 @@
 package net.runelite.client.plugins.ipcinput;
 
-import java.awt.*;
-import java.awt.Point;
+import java.awt.Component;
+import java.awt.Rectangle;
+import java.awt.Shape;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
@@ -21,14 +22,19 @@ import com.google.gson.annotations.SerializedName;
 import com.google.inject.Provides;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
+import net.runelite.client.game.ItemManager;
 //import net.runelite.api.Point;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetInfo;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.api.events.MenuOptionClicked;
 import static net.runelite.api.CollisionDataFlag.*;
 
 
@@ -54,6 +60,9 @@ public class IpcInputPlugin extends Plugin
     private PathOverlay pathOverlay;
 
     private ServerThread serverThread;
+
+    // Last interaction data for click verification
+    private Map<String, Object> lastInteraction = null;
 
     // Edgeville Bank bounds
     private static final int EDGE_BANK_MIN_X = 3092;
@@ -81,7 +90,7 @@ public class IpcInputPlugin extends Plugin
         overlayManager.add(pathOverlay);
 
         try {
-            serverThread = new ServerThread(client, clientThread, config, port, pathOverlay);
+            serverThread = new ServerThread(this, client, clientThread, config, port, pathOverlay);
             serverThread.start();
             log.info("IPC Input listening on {}", port);
             clientThread.invokeLater(() ->
@@ -122,10 +131,62 @@ public class IpcInputPlugin extends Plugin
         log.info("IPC Input stopped");
     }
 
+    @Subscribe
+    public void onMenuOptionClicked(MenuOptionClicked event) {
+        if (event.getMenuOption() != null && event.getMenuTarget() != null) {
+            log.debug("Menu clicked: {} on {}", event.getMenuOption(), event.getMenuTarget());
+            
+            // Simple interaction tracking - only essential info
+            Map<String, Object> interaction = new HashMap<>();
+            interaction.put("action", event.getMenuOption());
+            interaction.put("target", event.getMenuTarget());
+            interaction.put("timestamp", System.currentTimeMillis());
+            
+            // Extract target name (item/object/npc name)
+            String targetName = event.getMenuTarget();
+            if (targetName.contains(">")) {
+                targetName = targetName.split(">")[1].trim();
+            }
+            interaction.put("target_name", targetName);
+            
+            // Add mouse coordinates
+            net.runelite.api.Point mousePos = client.getMouseCanvasPosition();
+            Map<String, Object> mouseCoords = new HashMap<>();
+            mouseCoords.put("canvasX", mousePos.getX());
+            mouseCoords.put("canvasY", mousePos.getY());
+            interaction.put("mouse_coordinates", mouseCoords);
+            
+            // Add world coordinates of the click
+            Tile clickedTile = client.getSelectedSceneTile();
+            if (clickedTile != null) {
+                WorldPoint worldPos = clickedTile.getWorldLocation();
+                Map<String, Object> worldCoords = new HashMap<>();
+                worldCoords.put("worldX", worldPos.getX());
+                worldCoords.put("worldY", worldPos.getY());
+                worldCoords.put("plane", worldPos.getPlane());
+                interaction.put("world_coordinates", worldCoords);
+            } else {
+                interaction.put("world_coordinates", null);
+            }
+            
+            // Store the interaction
+            lastInteraction = interaction;
+        }
+    }
+
+    /**
+     * Get the last interaction data captured by the plugin.
+     * @return Map containing the last interaction data, or null if no interaction has been captured
+     */
+    public Map<String, Object> getLastInteraction() {
+        return lastInteraction;
+    }
+
     /* ======================= Server Thread ======================= */
 
     private static final class ServerThread extends Thread
     {
+        private final IpcInputPlugin plugin;
         private final Client client;
         private final ClientThread clientThread;
         private final IpcInputConfig config;
@@ -144,6 +205,84 @@ public class IpcInputPlugin extends Plugin
         }
         private static String safeMsg(Throwable t) {
             return (t == null || t.getMessage() == null) ? t.toString() : t.getMessage();
+        }
+
+        private static java.util.Map<String,Object> createObjectData(TileObject obj, String objectType, int baseX, int baseY, int plane, Client client, String needle) {
+            final java.util.Map<String,Object> objData = new java.util.LinkedHashMap<>();
+            
+            final int id = obj.getId();
+            final ObjectComposition comp = client.getObjectDefinition(id);
+            String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
+            String[] actions = null;
+            
+            // Handle impostor IDs
+            if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
+                int[] impostorIds = comp.getImpostorIds();
+                if (impostorIds != null && impostorIds.length > 0) {
+                    for (int impostorId : impostorIds) {
+                        if (impostorId != -1) {
+                            ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
+                            if (impostorComp != null) {
+                                String impostorName = impostorComp.getName();
+                                if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
+                                    nm = impostorName;
+                                    actions = impostorComp.getActions();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (comp != null) {
+                actions = comp.getActions();
+            }
+
+            final int wx = baseX + obj.getLocalLocation().getSceneX();
+            final int wy = baseY + obj.getLocalLocation().getSceneY();
+            final int distance = Math.abs(wx - client.getLocalPlayer().getWorldLocation().getX()) + Math.abs(wy - client.getLocalPlayer().getWorldLocation().getY());
+
+            objData.put("id", id);
+            objData.put("type", objectType);
+            objData.put("name", nm);
+            objData.put("world", java.util.Map.of("x", wx, "y", wy, "p", plane));
+            objData.put("distance", distance);
+            objData.put("exactMatch", nm.toLowerCase().equals(needle));
+
+            if (actions != null) {
+                java.util.List<String> al = new java.util.ArrayList<>();
+                for (String a : actions) if (a != null) al.add(a);
+                objData.put("actions", al);
+            }
+
+            // Get bounds/canvas position
+            try {
+                final java.awt.Shape hull = (obj instanceof GameObject) ? ((GameObject)obj).getConvexHull()
+                        : (obj instanceof DecorativeObject) ? ((DecorativeObject)obj).getConvexHull()
+                        : (obj instanceof WallObject) ? ((WallObject)obj).getConvexHull()
+                        : (obj instanceof GroundObject) ? ((GroundObject)obj).getConvexHull()
+                        : null;
+                if (hull != null) {
+                    final java.awt.Rectangle rb = hull.getBounds();
+                    if (rb != null) {
+                        objData.put("bounds", java.util.Map.of(
+                                "x", rb.x, "y", rb.y, "width", rb.width, "height", rb.height));
+                        objData.put("canvas", java.util.Map.of(
+                                "x", rb.x + rb.width/2, "y", rb.y + rb.height/2));
+                        objData.put("orientation", (rb.width > rb.height) ? "horizontal" : "vertical");
+                    }
+                }
+            } catch (Exception ignored) {}
+
+            // Fallback: tile center projection
+            try {
+                final LocalPoint lp = LocalPoint.fromWorld(client, wx, wy);
+                if (lp != null) {
+                    final net.runelite.api.Point pt = Perspective.localToCanvas(client, lp, plane);
+                    if (pt != null) objData.put("tileCanvas", java.util.Map.of("x", pt.getX(), "y", pt.getY()));
+                }
+            } catch (Exception ignored) {}
+
+            return objData;
         }
 
 
@@ -219,9 +358,10 @@ public class IpcInputPlugin extends Plugin
             }
         }
 
-        ServerThread(Client client, ClientThread clientThread, IpcInputConfig config, int port, PathOverlay pathOverlay)
+        ServerThread(IpcInputPlugin plugin, Client client, ClientThread clientThread, IpcInputConfig config, int port, PathOverlay pathOverlay)
         {
             super("IPC-Input-Server");
+            this.plugin = plugin;
             setDaemon(true);
             this.client = client;
             this.clientThread = clientThread;
@@ -298,7 +438,7 @@ public class IpcInputPlugin extends Plugin
                                     }
                                 } catch (Throwable ignored) {}
                                 // Advertise supported cmds to help you spot version skew
-                                resp.put("cmds", new String[]{"ping","click","scroll","path","project","objects"});
+                                resp.put("cmds", new String[]{"ping","click","scroll","path","project","objects","npcs","tab","hovered","widget_exists","get_widget","get_widget_info","get_widget_children","get_bank_items","get_bank_tabs","get_bank_quantity_buttons","get_bank_deposit_buttons","get_bank_note_toggle","get_bank_search","bank-xvalue","get_ge_widgets","get_ge_offers","get_ge_setup","get_ge_confirm","get_ge_buttons","door_state","get_player","get_equipment","get_equipment_inventory","get_spellbook","get_camera","find_object","find_object_by_path","find_npc","scan_scene","detect_water","get_tutorial","get_game_state","get_world","hop_world"});
                                 out.println(gson.toJson(resp));
                                 break;
                             }
@@ -307,6 +447,86 @@ public class IpcInputPlugin extends Plugin
                             case "port":
                                 out.println("{\"ok\":true,\"port\":" + port + "}");
                                 break;
+
+                            case "get_game_state": {
+                                final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                try {
+                                    GameState gameState = client.getGameState();
+                                    resp.put("ok", true);
+                                    resp.put("state", gameState.toString());
+                                } catch (Throwable t) {
+                                    resp.put("ok", false);
+                                    resp.put("err", "get-game-state-failed");
+                                }
+                                out.println(gson.toJson(resp));
+                                break;
+                            }
+
+                            case "get_world": {
+                                final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                try {
+                                    int worldNumber = client.getWorld();
+                                    resp.put("ok", true);
+                                    resp.put("world", worldNumber);
+                                } catch (Throwable t) {
+                                    resp.put("ok", false);
+                                    resp.put("err", "get-world-failed");
+                                }
+                                out.println(gson.toJson(resp));
+                                break;
+                            }
+
+                            case "hop_world": {
+                                final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                try {
+                                    Integer targetWorldId = cmd.world_id;
+                                    if (targetWorldId == null) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "world_id required");
+                                    } else {
+                                        // Find the world in the world list
+                                        net.runelite.api.World[] worldArray = client.getWorldList();
+                                        net.runelite.api.World targetWorld = null;
+                                        for (int i = 0; i < worldArray.length; i++) {
+                                            net.runelite.api.World world = worldArray[i];
+                                            if (world.getId() == targetWorldId) {
+                                                targetWorld = world;
+                                                break;
+                                            }
+                                        }
+                                        
+                                        if (targetWorld != null) {
+                                            client.hopToWorld(targetWorld);
+                                            resp.put("ok", true);
+                                            resp.put("message", "Hopped to world " + targetWorldId);
+                                        } else {
+                                            resp.put("ok", false);
+                                            resp.put("err", "World " + targetWorldId + " not found");
+                                        }
+                                    }
+                                } catch (Throwable t) {
+                                    resp.put("ok", false);
+                                    resp.put("err", "hop-world-failed");
+                                    resp.put("exception", t.getMessage());
+                                }
+                                out.println(gson.toJson(resp));
+                                break;
+                            }
+
+                            case "openWorldHopper": {
+                                final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                try {
+                                    client.openWorldHopper();
+                                    resp.put("ok", true);
+                                    resp.put("message", "World hopper opened");
+                                } catch (Throwable t) {
+                                    resp.put("ok", false);
+                                    resp.put("err", "open-world-hopper-failed");
+                                    resp.put("exception", t.getMessage());
+                                }
+                                out.println(gson.toJson(resp));
+                                break;
+                            }
 
                             case "where": {
                                 final Component c = (Component) client.getCanvas();
@@ -317,7 +537,7 @@ public class IpcInputPlugin extends Plugin
                                 }
                                 try
                                 {
-                                    final Point p = c.getLocationOnScreen();
+                                    final java.awt.Point p = c.getLocationOnScreen();
                                     out.println("{\"ok\":true,\"x\":" + p.x + ",\"y\":" + p.y +
                                             ",\"w\":" + c.getWidth() + ",\"h\":" + c.getHeight() + "}");
                                 }
@@ -332,72 +552,221 @@ public class IpcInputPlugin extends Plugin
                                 if (cmd.x == null || cmd.y == null) { out.println("{\"ok\":false,\"err\":\"need x,y\"}"); break; }
                                 final int cx = cmd.x, cy = cmd.y;
                                 final int btn = (cmd.button == null) ? 1 : cmd.button;
-                                final String mode = config.mode().trim().toUpperCase();
-
-                                if ("ROBOT".equals(mode)) {
-                                    clientThread.invokeLater(() -> {
-                                        try {
-                                            final java.awt.Component comp = (java.awt.Component) client.getCanvas();
-                                            if (comp == null) return;
-                                            final java.awt.Point origin = comp.getLocationOnScreen();
-                                            final int sx = origin.x + cx;
-                                            final int sy = origin.y + cy;
-                                            final java.awt.Robot r = new java.awt.Robot();
-                                            final int mask = (btn == 3) ? java.awt.event.InputEvent.BUTTON3_DOWN_MASK
-                                                    : (btn == 2) ? java.awt.event.InputEvent.BUTTON2_DOWN_MASK
-                                                    : java.awt.event.InputEvent.BUTTON1_DOWN_MASK;
-                                            r.mouseMove(sx, sy);
-                                            r.mousePress(mask);
-                                            r.mouseRelease(mask);
-                                        } catch (Exception ignored) {}
-                                    });
-                                    out.println("{\"ok\":true,\"mode\":\"ROBOT\"}");
-                                    break;
-                                }
-
-                                // AWT dispatch (window showing / background-capable)
+                                final boolean hoverOnly = Boolean.TRUE.equals(cmd.hoverOnly);
                                 final int hoverDelay = Math.max(0, config.hoverDelayMs());
 
-                                // >>> RESPOND BEFORE scheduling async UI work <<<
-                                out.println("{\"ok\":true,\"mode\":\"AWT\",\"hoverDelayMs\":" + hoverDelay + "}");
+                                final boolean onLogin =
+                                        client.getGameState() == GameState.LOGIN_SCREEN ||
+                                                client.getGameState() == GameState.LOGIN_SCREEN_AUTHENTICATOR;
+
+                                out.println("{\"ok\":true,\"mode\":\"" + (onLogin ? "AWT_LOGIN" : "AWT") + "\",\"hoverDelayMs\":" + hoverDelay + "}");
 
                                 javax.swing.SwingUtilities.invokeLater(() -> {
                                     try {
-                                        final java.awt.Component c = (java.awt.Component) client.getCanvas();
-                                        if (c == null) return;
+                                        java.awt.Component comp = (java.awt.Component) client.getCanvas();
+                                        if (comp == null) return;
 
-                                        // 1) Hover
-                                        long now = System.currentTimeMillis();
-                                        c.dispatchEvent(new java.awt.event.MouseEvent(
-                                                c, java.awt.event.MouseEvent.MOUSE_MOVED, now, 0, cx, cy, 0, false));
-                                        c.requestFocusInWindow();
-
-                                        // 2) Click after delay
-                                        final int awtButton = (btn == 3) ? java.awt.event.MouseEvent.BUTTON3
-                                                : (btn == 2) ? java.awt.event.MouseEvent.BUTTON2
-                                                : java.awt.event.MouseEvent.BUTTON1;
-
-                                        javax.swing.Timer t = new javax.swing.Timer(hoverDelay, ev -> {
-                                            final boolean wasFocusable = c.isFocusable();
-                                            try {
-                                                c.setFocusable(false);
-                                                long t0 = System.currentTimeMillis();
-                                                c.dispatchEvent(new java.awt.event.MouseEvent(
-                                                        c, java.awt.event.MouseEvent.MOUSE_PRESSED,  t0,   0, cx, cy, 1, false, awtButton));
-                                                c.dispatchEvent(new java.awt.event.MouseEvent(
-                                                        c, java.awt.event.MouseEvent.MOUSE_RELEASED, t0+1, 0, cx, cy, 1, false, awtButton));
-                                                c.dispatchEvent(new java.awt.event.MouseEvent(
-                                                        c, java.awt.event.MouseEvent.MOUSE_CLICKED,  t0+2, 0, cx, cy, 1, false, awtButton));
-                                            } finally {
-                                                c.setFocusable(wasFocusable);
+                                        // Login screen handling
+                                        if (onLogin) {
+                                            // Bounds guard (canvas-local coords)
+                                            if (cx < 0 || cy < 0 || cx >= comp.getWidth() || cy >= comp.getHeight()) {
+                                                log.info("login-click OOB: canvas={}x{} target=({}, {})",
+                                                        comp.getWidth(), comp.getHeight(), cx, cy);
+                                                return;
                                             }
-                                        });
-                                        t.setRepeats(false);
-                                        t.start();
+
+                                            // --- LOGIN: post events via AWT System EventQueue (don’t dispatch directly) ---
+                                            final java.awt.EventQueue q = java.awt.Toolkit.getDefaultToolkit().getSystemEventQueue();
+                                            final long t0 = System.currentTimeMillis();
+
+                                            // Move
+                                            q.postEvent(new java.awt.event.MouseEvent(
+                                                    comp, java.awt.event.MouseEvent.MOUSE_MOVED, t0, 0,
+                                                    cx, cy, 0, false, java.awt.event.MouseEvent.NOBUTTON));
+
+                                            if (!hoverOnly) {
+                                                final int awtButton = (btn == 3) ? java.awt.event.MouseEvent.BUTTON3
+                                                        : (btn == 2) ? java.awt.event.MouseEvent.BUTTON2
+                                                        : java.awt.event.MouseEvent.BUTTON1;
+                                                final int modMask = (btn == 3) ? java.awt.event.InputEvent.BUTTON3_DOWN_MASK
+                                                        : (btn == 2) ? java.awt.event.InputEvent.BUTTON2_DOWN_MASK
+                                                        : java.awt.event.InputEvent.BUTTON1_DOWN_MASK;
+
+                                                try { Thread.sleep(hoverDelay); } catch (InterruptedException ignored) {}
+
+                                                // Press
+                                                q.postEvent(new java.awt.event.MouseEvent(
+                                                        comp, java.awt.event.MouseEvent.MOUSE_PRESSED, t0 + 1, modMask,
+                                                        cx, cy, 1, false, awtButton));
+                                                try { Thread.sleep(5); } catch (InterruptedException ignored) {}
+
+                                                // Release
+                                                q.postEvent(new java.awt.event.MouseEvent(
+                                                        comp, java.awt.event.MouseEvent.MOUSE_RELEASED, t0 + 6, modMask,
+                                                        cx, cy, 1, false, awtButton));
+
+                                                // Click (no mask)
+                                                q.postEvent(new java.awt.event.MouseEvent(
+                                                        comp, java.awt.event.MouseEvent.MOUSE_CLICKED, t0 + 11, 0,
+                                                        cx, cy, 1, false, awtButton));
+                                            }
+
+                                            return; // login handled; skip in-game path
+                                        }
+
+                                        // --- IN-GAME: keep your existing dispatch pattern (works fine for you) ---
+                                        long now = System.currentTimeMillis();
+                                        comp.dispatchEvent(new java.awt.event.MouseEvent(
+                                                comp, java.awt.event.MouseEvent.MOUSE_MOVED, now, 0, cx, cy, 0, false));
+
+                                        if (!hoverOnly) {
+                                            final int awtButton = (btn == 3) ? java.awt.event.MouseEvent.BUTTON3
+                                                    : (btn == 2) ? java.awt.event.MouseEvent.BUTTON2
+                                                    : java.awt.event.MouseEvent.BUTTON1;
+                                            final int modMask = (btn == 3) ? java.awt.event.InputEvent.BUTTON3_DOWN_MASK
+                                                    : (btn == 2) ? java.awt.event.InputEvent.BUTTON2_DOWN_MASK
+                                                    : java.awt.event.InputEvent.BUTTON1_DOWN_MASK;
+
+                                            javax.swing.Timer t = new javax.swing.Timer(hoverDelay, ev -> {
+                                                long t0 = System.currentTimeMillis();
+                                                // Press (use mask so listeners see the button)
+                                                comp.dispatchEvent(new java.awt.event.MouseEvent(
+                                                        comp, java.awt.event.MouseEvent.MOUSE_PRESSED,  t0,   modMask, cx, cy, 1, false, awtButton));
+                                                try { Thread.sleep(5); } catch (InterruptedException ignored) {}
+                                                comp.dispatchEvent(new java.awt.event.MouseEvent(
+                                                        comp, java.awt.event.MouseEvent.MOUSE_RELEASED, t0+5, modMask, cx, cy, 1, false, awtButton));
+                                                comp.dispatchEvent(new java.awt.event.MouseEvent(
+                                                        comp, java.awt.event.MouseEvent.MOUSE_CLICKED,  t0+10, 0,      cx, cy, 1, false, awtButton));
+                                            });
+                                            t.setRepeats(false);
+                                            t.start();
+                                        }
                                     } catch (Exception e) {
-                                        log.warn("AWT move+click scheduling failed: {}", e.toString());
+                                        log.warn("click handler failed: {}", e.toString());
                                     }
                                 });
+                                break;
+                            }
+
+                            case "get_last_interaction": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get the last interaction data directly from this plugin
+                                        java.util.Map<String, Object> lastInteraction = plugin.getLastInteraction();
+                                        if (lastInteraction != null) {
+                                            resp.put("ok", true);
+                                            resp.put("interaction", lastInteraction);
+                                        } else {
+                                            resp.put("ok", true);
+                                            resp.put("interaction", null);
+                                        }
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-last-interaction-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_players": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        java.util.List<java.util.Map<String,Object>> players = new java.util.ArrayList<>();
+                                        
+                                        // Get all players in the scene
+                                        java.util.List<Player> allPlayers = client.getPlayers();
+                                        if (allPlayers != null) {
+                                            for (Player player : allPlayers) {
+                                                if (player != null) {
+                                                    java.util.Map<String,Object> playerData = new java.util.LinkedHashMap<>();
+                                                    
+                                                    // Basic player info
+                                                    playerData.put("name", player.getName());
+                                                    playerData.put("combatLevel", player.getCombatLevel());
+                                                    playerData.put("isLocalPlayer", player == client.getLocalPlayer());
+                                                    
+                                                    // World location
+                                                    WorldPoint worldLocation = player.getWorldLocation();
+                                                    if (worldLocation != null) {
+                                                        playerData.put("worldX", worldLocation.getX());
+                                                        playerData.put("worldY", worldLocation.getY());
+                                                        playerData.put("plane", worldLocation.getPlane());
+                                                    }
+                                                    
+                                                    // Canvas location
+                                                    java.awt.Polygon canvasTilePoly = player.getCanvasTilePoly();
+                                                    if (canvasTilePoly != null) {
+                                                        playerData.put("canvasX", canvasTilePoly.getBounds().x + canvasTilePoly.getBounds().width / 2);
+                                                        playerData.put("canvasY", canvasTilePoly.getBounds().y + canvasTilePoly.getBounds().height / 2);
+                                                    }
+                                                    
+                                                    // Bounds
+                                                    java.awt.Rectangle bounds = player.getCanvasTilePoly().getBounds();
+                                                    if (bounds != null) {
+                                                        playerData.put("bounds", java.util.Map.of(
+                                                            "x", bounds.x,
+                                                            "y", bounds.y,
+                                                            "width", bounds.width,
+                                                            "height", bounds.height
+                                                        ));
+                                                    }
+                                                    
+                                                    // Animation
+                                                    playerData.put("animation", player.getAnimation());
+                                                    
+                                                    // Health info
+                                                    playerData.put("healthRatio", player.getHealthRatio());
+                                                    playerData.put("healthScale", player.getHealthScale());
+                                                    
+                                                    // Skull icon
+                                                    playerData.put("skullIcon", player.getSkullIcon());
+                                                    
+                                                    // Overhead icon
+                                                    playerData.put("overheadIcon", player.getOverheadIcon());
+                                                    
+                                                    players.add(playerData);
+                                                }
+                                            }
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("players", players);
+                                        resp.put("count", players.size());
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-players-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
                                 break;
                             }
 
@@ -552,7 +921,6 @@ public class IpcInputPlugin extends Plugin
                                 final String key = (cmd.key == null) ? "" : String.valueOf(cmd.key);
                                 final int ms = (cmd.ms == null) ? 120 : Math.max(20, cmd.ms);
                                 final String mode = config.mode().trim().toUpperCase();
-                                out.println("Key hold started. Mode = " + mode + ", Key = " + key + ", ms = " + ms);
 
                                 // AWT dispatch to the RuneLite canvas (works while window is showing, even if not OS-active)
                                 new Thread(() -> {
@@ -581,7 +949,61 @@ public class IpcInputPlugin extends Plugin
                                     }
                                 }, "ipc-keyhold-awt").start();
 
-                                out.println("{\"ok\":true,\"mode\":\"AWT\",\"ms\":"+ms+"}");
+                                out.println("{\"ok\":true,\"mode\":\""+mode+"\",\"key\":\""+key+"\",\"ms\":"+ms+"}");
+                                break;
+                            }
+
+                            case "keyPress": {
+                                final String key = (cmd.key == null) ? "" : String.valueOf(cmd.key);
+                                final String mode = config.mode().trim().toUpperCase();
+
+                                // AWT dispatch to the RuneLite canvas (works while window is showing, even if not OS-active)
+                                new Thread(() -> {
+                                    try {
+                                        final java.awt.Component c = (java.awt.Component) client.getCanvas();
+                                        if (c == null) return;
+                                        final int vk = keyCodeFrom(key);
+                                        if (vk < 0) { log.warn("[IPC] keyPress unknown key '{}'", key); return; }
+
+                                        final long t0 = System.currentTimeMillis();
+                                        java.awt.EventQueue.invokeAndWait(() -> {
+                                            c.dispatchEvent(new java.awt.event.KeyEvent(
+                                                    c, java.awt.event.KeyEvent.KEY_PRESSED, t0, 0, vk,
+                                                    java.awt.event.KeyEvent.CHAR_UNDEFINED));
+                                        });
+                                    } catch (Exception e) {
+                                        log.warn("[IPC] keyPress AWT failed: {}", e.toString());
+                                    }
+                                }, "ipc-keypress-awt").start();
+
+                                out.println("{\"ok\":true,\"mode\":\""+mode+"\",\"key\":\""+key+"\"}");
+                                break;
+                            }
+
+                            case "keyRelease": {
+                                final String key = (cmd.key == null) ? "" : String.valueOf(cmd.key);
+                                final String mode = config.mode().trim().toUpperCase();
+
+                                // AWT dispatch to the RuneLite canvas (works while window is showing, even if not OS-active)
+                                new Thread(() -> {
+                                    try {
+                                        final java.awt.Component c = (java.awt.Component) client.getCanvas();
+                                        if (c == null) return;
+                                        final int vk = keyCodeFrom(key);
+                                        if (vk < 0) { log.warn("[IPC] keyRelease unknown key '{}'", key); return; }
+
+                                        final long t0 = System.currentTimeMillis();
+                                        java.awt.EventQueue.invokeAndWait(() -> {
+                                            c.dispatchEvent(new java.awt.event.KeyEvent(
+                                                    c, java.awt.event.KeyEvent.KEY_RELEASED, t0, 0, vk,
+                                                    java.awt.event.KeyEvent.CHAR_UNDEFINED));
+                                        });
+                                    } catch (Exception e) {
+                                        log.warn("[IPC] keyRelease AWT failed: {}", e.toString());
+                                    }
+                                }, "ipc-keyrelease-awt").start();
+
+                                out.println("{\"ok\":true,\"mode\":\""+mode+"\",\"key\":\""+key+"\"}");
                                 break;
                             }
 
@@ -666,9 +1088,34 @@ public class IpcInputPlugin extends Plugin
                                             if (obj == null) return;
                                             final int id = obj.getId();
                                             final ObjectComposition comp = client.getObjectDefinition(id);
-                                            final String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
+                                            String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
+                                            String[] actions = null;
+                                            
+                                            // Check for impostor IDs if name is null or empty
+                                            if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
+                                                int[] impostorIds = comp.getImpostorIds();
+                                                if (impostorIds != null && impostorIds.length > 0) {
+                                                    // Try each impostor ID to find one with a valid name
+                                                    for (int impostorId : impostorIds) {
+                                                        if (impostorId != -1) {
+                                                            ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
+                                                            if (impostorComp != null) {
+                                                                String impostorName = impostorComp.getName();
+                                                                if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
+                                                                    nm = impostorName;
+                                                                    actions = impostorComp.getActions();
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            } else if (comp != null) {
+                                                actions = comp.getActions();
+                                            }
+                                            
                                             final String nmLower = nm.toLowerCase();
-                                            if (!needle.isEmpty() && !nmLower.contains(needle)) return;
+                                            if (!needle.isEmpty() && !nmLower.equals(needle)) return;
 
                                             // world coords from local
                                             final int wx = baseX + obj.getLocalLocation().getSceneX();
@@ -679,7 +1126,7 @@ public class IpcInputPlugin extends Plugin
                                             row.put("type", kind);
                                             row.put("id", id);
                                             row.put("name", nm);
-                                            row.put("actions", (comp != null) ? comp.getActions() : null);
+                                            row.put("actions", actions);
                                             row.put("world", java.util.Map.of("x", wx, "y", wy, "p", plane));
                                             row.put("distance", Math.abs(wx - myWx) + Math.abs(wy - myWy));
 
@@ -763,6 +1210,1488 @@ public class IpcInputPlugin extends Plugin
                                 break;
                             }
 
+                            case "npcs": {
+                                final String needle = (cmd.name == null ? "" : cmd.name.trim().toLowerCase());
+                                final int radius = (cmd.radius == null) ? 26 : Math.max(1, cmd.radius);
+
+                                final java.util.concurrent.CompletableFuture<java.util.List<java.util.Map<String,Object>>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.List<java.util.Map<String,Object>> npcsOut = new java.util.ArrayList<>();
+                                    try {
+                                        final Player me = client.getLocalPlayer();
+                                        final Scene scene = client.getScene();
+                                        if (me == null || scene == null) { fut.complete(npcsOut); return; }
+
+                                        final int plane = client.getPlane();
+                                        final int baseX = client.getBaseX(), baseY = client.getBaseY();
+                                        final int myWx = me.getWorldLocation().getX();
+                                        final int myWy = me.getWorldLocation().getY();
+                                        final int minWx = myWx - radius, maxWx = myWx + radius;
+                                        final int minWy = myWy - radius, maxWy = myWy + radius;
+
+                                        // Get all NPCs from the client
+                                        final java.util.List<NPC> npcs = client.getNpcs();
+                                        if (npcs == null) { fut.complete(npcsOut); return; }
+
+                                        for (NPC npc : npcs) {
+                                            if (npc == null) continue;
+
+                                            // Get NPC composition for name and actions
+                                            final NPCComposition comp = client.getNpcDefinition(npc.getId());
+                                            final String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
+                                            final String nmLower = nm.toLowerCase();
+                                            if (!needle.isEmpty() && !nmLower.contains(needle)) continue;
+
+                                            // Get world coordinates
+                                            final int wx = npc.getWorldLocation().getX();
+                                            final int wy = npc.getWorldLocation().getY();
+                                            if (wx < minWx || wx > maxWx || wy < minWy || wy > maxWy) continue;
+
+                                            final java.util.Map<String,Object> row = new java.util.LinkedHashMap<>();
+                                            row.put("type", "NPC");
+                                            row.put("id", npc.getId());
+                                            row.put("name", nm);
+                                            row.put("actions", (comp != null) ? comp.getActions() : null);
+                                            row.put("world", java.util.Map.of("x", wx, "y", wy, "p", plane));
+                                            row.put("distance", Math.abs(wx - myWx) + Math.abs(wy - myWy));
+                                            
+                                            // Add combat status
+                                            Actor interacting = npc.getInteracting();
+                                            boolean inCombat = (interacting != null);
+                                            row.put("inCombat", inCombat);
+                                            if (inCombat) {
+                                                row.put("combatTarget", interacting.getName());
+                                                row.put("combatTargetType", interacting instanceof Player ? "Player" : "NPC");
+                                            }
+
+                                            // Get canvas position from convex hull if available
+                                            try {
+                                                final java.awt.Shape hull = npc.getConvexHull();
+                                                if (hull != null) {
+                                                    final java.awt.Rectangle rb = hull.getBounds();
+                                                    if (rb != null) {
+                                                        row.put("bounds", java.util.Map.of(
+                                                                "x", rb.x, "y", rb.y, "width", rb.width, "height", rb.height));
+                                                        row.put("canvas", java.util.Map.of(
+                                                                "x", rb.x + rb.width/2, "y", rb.y + rb.height/2));
+                                                        row.put("orientation", (rb.width > rb.height) ? "horizontal" : "vertical");
+                                                    }
+                                                }
+                                            } catch (Exception ignored) {}
+
+                                            // Fallback: tile center projection
+                                            try {
+                                                final LocalPoint lp = LocalPoint.fromWorld(client, wx, wy);
+                                                if (lp != null) {
+                                                    final net.runelite.api.Point pt = Perspective.localToCanvas(client, lp, plane);
+                                                    if (pt != null) row.put("tileCanvas", java.util.Map.of("x", pt.getX(), "y", pt.getY()));
+                                                }
+                                            } catch (Exception ignored) {}
+
+                                            npcsOut.add(row);
+                                        }
+
+                                        // Sort by distance, then name
+                                        npcsOut.sort((a,b) -> {
+                                            int da = ((Number)a.getOrDefault("distance", 1_000_000)).intValue();
+                                            int db = ((Number)b.getOrDefault("distance", 1_000_000)).intValue();
+                                            if (da != db) return Integer.compare(da, db);
+                                            String na = String.valueOf(a.getOrDefault("name",""));
+                                            String nb = String.valueOf(b.getOrDefault("name",""));
+                                            return na.compareToIgnoreCase(nb);
+                                        });
+
+                                    } catch (Throwable ignored) {
+                                    } finally {
+                                        fut.complete(npcsOut);
+                                    }
+                                });
+
+                                java.util.List<java.util.Map<String,Object>> found;
+                                try {
+                                    found = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    found = java.util.Collections.emptyList();
+                                }
+
+                                java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                resp.put("ok", true);
+                                resp.put("count", found.size());
+                                resp.put("npcs", found);
+                                out.println(gson.toJson(resp));
+                                break;
+                            }
+
+                            case "find_object": {
+                                final String needle = (cmd.name == null ? "" : cmd.name.trim().toLowerCase());
+                                final int radius = (cmd.radius == null) ? 26 : Math.max(1, cmd.radius);
+                                final String objectType = (cmd.types != null && !cmd.types.isEmpty()) ? cmd.types.get(0).trim().toUpperCase() : "GAME";
+                                final boolean exactMatch = (cmd.exactMatch != null) ? cmd.exactMatch : false;
+
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        final Player me = client.getLocalPlayer();
+                                        final Scene scene = client.getScene();
+                                        if (me == null || scene == null) { 
+                                            resp.put("ok", false); resp.put("err", "no-player-or-scene"); 
+                                            fut.complete(resp); return; 
+                                        }
+
+                                        final int plane = client.getPlane();
+                                        final int baseX = client.getBaseX(), baseY = client.getBaseY();
+                                        final int myWx = me.getWorldLocation().getX();
+                                        final int myWy = me.getWorldLocation().getY();
+                                        final int minWx = myWx - radius, maxWx = myWx + radius;
+                                        final int minWy = myWy - radius, maxWy = myWy + radius;
+
+                                        final Tile[][][] tiles = scene.getTiles();
+                                        if (tiles == null || plane < 0 || plane >= tiles.length || tiles[plane] == null) {
+                                            resp.put("ok", false); resp.put("err", "no-tiles"); 
+                                            fut.complete(resp); return;
+                                        }
+
+                                        // Helper to check if object matches name early (before expensive operations)
+                                        java.util.function.Predicate<TileObject> nameMatches = (obj) -> {
+                                            if (obj == null) return false;
+                                            final int id = obj.getId();
+                                            final ObjectComposition comp = client.getObjectDefinition(id);
+                                            String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
+                                            
+                                            // Check for impostor IDs if name is null or empty
+                                            if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
+                                                int[] impostorIds = comp.getImpostorIds();
+                                                if (impostorIds != null && impostorIds.length > 0) {
+                                                    for (int impostorId : impostorIds) {
+                                                        if (impostorId != -1) {
+                                                            ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
+                                                            if (impostorComp != null) {
+                                                                String impostorName = impostorComp.getName();
+                                                                if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
+                                                                    nm = impostorName;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            
+                                            final String nmLower = nm.toLowerCase();
+                                            if (needle.isEmpty()) return true;
+                                            
+                                            // Use exact match if specified
+                                            if (exactMatch) {
+                                                return nmLower.equals(needle);
+                                            }
+                                            
+                                            // For "tree", be more specific - avoid gates, doors, etc.
+                                            if ("tree".equals(needle)) {
+                                                return nmLower.equals("tree") || 
+                                                       nmLower.startsWith("tree ") || 
+                                                       nmLower.endsWith(" tree") ||
+                                                       (nmLower.contains("tree") && !nmLower.contains("gate") && !nmLower.contains("door"));
+                                            }
+                                            
+                                            // For other objects, use normal matching
+                                            return nmLower.equals(needle) || nmLower.contains(needle);
+                                        };
+
+                                        // Scan tiles and collect all matching objects, then pick the best one
+                                        final int minLx = Math.max(0, minWx - baseX), maxLx = Math.min(103, maxWx - baseX);
+                                        final int minLy = Math.max(0, minWy - baseY), maxLy = Math.min(103, maxWy - baseY);
+                                        
+                                        java.util.List<java.util.Map<String,Object>> candidates = new java.util.ArrayList<>();
+                                        
+                                        for (int lx = minLx; lx <= maxLx; lx++) {
+                                            for (int ly = minLy; ly <= maxLy; ly++) {
+                                                final Tile t = tiles[plane][lx][ly];
+                                                if (t == null) continue;
+
+                                                TileObject obj = null;
+                                                if ("WALL".equals(objectType)) obj = t.getWallObject();
+                                                else if ("DECOR".equals(objectType)) obj = t.getDecorativeObject();
+                                                else if ("GROUND".equals(objectType)) obj = t.getGroundObject();
+                                                else if ("GAME".equals(objectType)) {
+                                                    final GameObject[] arr = t.getGameObjects();
+                                                    if (arr != null) {
+                                                        for (GameObject go : arr) {
+                                                            if (go != null && nameMatches.test(go)) {
+                                                                obj = go;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                if (obj != null && nameMatches.test(obj)) {
+                                                    // Add to candidates list for later selection
+                                                    final int id = obj.getId();
+                                                    final ObjectComposition comp = client.getObjectDefinition(id);
+                                                    String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
+                                                    String[] actions = null;
+                                                    
+                                                    // Handle impostor IDs
+                                                    if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
+                                                        int[] impostorIds = comp.getImpostorIds();
+                                                        if (impostorIds != null && impostorIds.length > 0) {
+                                                            for (int impostorId : impostorIds) {
+                                                                if (impostorId != -1) {
+                                                                    ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
+                                                                    if (impostorComp != null) {
+                                                                        String impostorName = impostorComp.getName();
+                                                                        if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
+                                                                            nm = impostorName;
+                                                                            actions = impostorComp.getActions();
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    } else if (comp != null) {
+                                                        actions = comp.getActions();
+                                                    }
+
+                                                    final int wx = baseX + obj.getLocalLocation().getSceneX();
+                                                    final int wy = baseY + obj.getLocalLocation().getSceneY();
+                                                    final int distance = Math.abs(wx - myWx) + Math.abs(wy - myWy);
+
+                                                    final java.util.Map<String,Object> objData = new java.util.LinkedHashMap<>();
+                                                    objData.put("id", id);
+                                                    objData.put("type", objectType);
+                                                    objData.put("name", nm);
+                                                    objData.put("world", java.util.Map.of("x", wx, "y", wy, "p", plane));
+                                                    objData.put("distance", distance);
+                                                    objData.put("exactMatch", nm.toLowerCase().equals(needle));
+
+                                                    if (actions != null) {
+                                                        java.util.List<String> al = new java.util.ArrayList<>();
+                                                        for (String a : actions) if (a != null) al.add(a);
+                                                        objData.put("actions", al);
+                                                    }
+
+                                                    // Get bounds/canvas position
+                                                    try {
+                                                        final java.awt.Shape hull = (obj instanceof GameObject) ? ((GameObject)obj).getConvexHull()
+                                                                : (obj instanceof DecorativeObject) ? ((DecorativeObject)obj).getConvexHull()
+                                                                : (obj instanceof WallObject) ? ((WallObject)obj).getConvexHull()
+                                                                : (obj instanceof GroundObject) ? ((GroundObject)obj).getConvexHull()
+                                                                : null;
+                                                        if (hull != null) {
+                                                            final java.awt.Rectangle rb = hull.getBounds();
+                                                            if (rb != null) {
+                                                                objData.put("bounds", java.util.Map.of(
+                                                                        "x", rb.x, "y", rb.y, "width", rb.width, "height", rb.height));
+                                                                objData.put("canvas", java.util.Map.of(
+                                                                        "x", rb.x + rb.width/2, "y", rb.y + rb.height/2));
+                                                                objData.put("orientation", (rb.width > rb.height) ? "horizontal" : "vertical");
+                                                            }
+                                                        }
+                                                    } catch (Exception ignored) {}
+
+                                                    // Fallback: tile center projection
+                                                    try {
+                                                        final LocalPoint lp = LocalPoint.fromWorld(client, wx, wy);
+                                                        if (lp != null) {
+                                                            final net.runelite.api.Point pt = Perspective.localToCanvas(client, lp, plane);
+                                                            if (pt != null) objData.put("tileCanvas", java.util.Map.of("x", pt.getX(), "y", pt.getY()));
+                                                        }
+                                                    } catch (Exception ignored) {}
+
+                                                    candidates.add(objData);
+                                                }
+                                            }
+                                        }
+
+                                        // Select best candidate: prioritize exact matches, then closest distance
+                                        if (candidates.isEmpty()) {
+                                            resp.put("ok", true);
+                                            resp.put("found", false);
+                                            resp.put("object", null);
+                                        } else {
+                                            // Sort candidates: exact matches first, then by distance
+                                            candidates.sort((a, b) -> {
+                                                boolean aExact = (Boolean) a.getOrDefault("exactMatch", false);
+                                                boolean bExact = (Boolean) b.getOrDefault("exactMatch", false);
+                                                
+                                                if (aExact && !bExact) return -1;  // a is exact, b is not
+                                                if (!aExact && bExact) return 1;   // b is exact, a is not
+                                                
+                                                // Both same type (exact or not), sort by distance
+                                                int aDist = (Integer) a.getOrDefault("distance", Integer.MAX_VALUE);
+                                                int bDist = (Integer) b.getOrDefault("distance", Integer.MAX_VALUE);
+                                                return Integer.compare(aDist, bDist);
+                                            });
+                                            
+                                            resp.put("ok", true);
+                                            resp.put("found", true);
+                                            resp.put("object", candidates.get(0));
+                                        }
+
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false); resp.put("err", "find-object-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "find_object_by_path": {
+                                final String needle = (cmd.name == null ? "" : cmd.name.trim().toLowerCase());
+                                final int radius = (cmd.radius == null) ? 26 : Math.max(1, cmd.radius);
+
+                                // which object kinds to include
+                                final java.util.Set<String> kinds = new java.util.HashSet<>();
+                                if (cmd.types != null) {
+                                    for (String t : cmd.types) if (t != null) kinds.add(t.trim().toUpperCase());
+                                }
+                                if (kinds.isEmpty()) {
+                                    kinds.add("GAME");
+                                    kinds.add("WALL");
+                                    kinds.add("DECOR");
+                                    kinds.add("GROUND");
+                                }
+
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        final Player me = client.getLocalPlayer();
+                                        final Scene scene = client.getScene();
+                                        if (me == null || scene == null) { 
+                                            resp.put("ok", false); resp.put("err", "no-player-or-scene"); 
+                                            fut.complete(resp); return; 
+                                        }
+
+                                        final int plane = client.getPlane();
+                                        final int baseX = client.getBaseX(), baseY = client.getBaseY();
+                                        final int myWx = me.getWorldLocation().getX();
+                                        final int myWy = me.getWorldLocation().getY();
+                                        final int minWx = myWx - radius, maxWx = myWx + radius;
+                                        final int minWy = myWy - radius, maxWy = myWy + radius;
+
+                                        final Tile[][][] tiles = scene.getTiles();
+                                        if (tiles == null || plane < 0 || plane >= tiles.length || tiles[plane] == null) {
+                                            resp.put("ok", false); resp.put("err", "no-tiles"); 
+                                            fut.complete(resp); return;
+                                        }
+
+                                        // Helper to check if object matches name
+                                        java.util.function.Predicate<TileObject> nameMatches = (obj) -> {
+                                            if (obj == null) return false;
+                                            final int id = obj.getId();
+                                            final ObjectComposition comp = client.getObjectDefinition(id);
+                                            String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
+                                            
+                                            // Check for impostor IDs if name is null or empty
+                                            if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
+                                                int[] impostorIds = comp.getImpostorIds();
+                                                if (impostorIds != null && impostorIds.length > 0) {
+                                                    for (int impostorId : impostorIds) {
+                                                        if (impostorId != -1) {
+                                                            ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
+                                                            if (impostorComp != null) {
+                                                                String impostorName = impostorComp.getName();
+                                                                if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
+                                                                    nm = impostorName;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            
+                                            final String nmLower = nm.toLowerCase();
+                                            if (needle.isEmpty()) return true;
+                                            
+                                            // For "tree", be more specific - avoid gates, doors, etc.
+                                            if ("tree".equals(needle)) {
+                                                return nmLower.equals("tree") || 
+                                                       nmLower.startsWith("tree ") || 
+                                                       nmLower.endsWith(" tree") ||
+                                                       (nmLower.contains("tree") && !nmLower.contains("gate") && !nmLower.contains("door"));
+                                            }
+                                            
+                                            // For other objects, use normal matching
+                                            return nmLower.equals(needle) || nmLower.contains(needle);
+                                        };
+
+                                        // Collect all matching objects first
+                                        java.util.List<java.util.Map<String,Object>> candidates = new java.util.ArrayList<>();
+                                        
+                                        final int minLx = Math.max(0, minWx - baseX), maxLx = Math.min(103, maxWx - baseX);
+                                        final int minLy = Math.max(0, minWy - baseY), maxLy = Math.min(103, maxWy - baseY);
+                                        
+                                        for (int lx = minLx; lx <= maxLx; lx++) {
+                                            for (int ly = minLy; ly <= maxLy; ly++) {
+                                                final Tile t = tiles[plane][lx][ly];
+                                                if (t == null) continue;
+
+                                                // Check all object types
+                                                if (kinds.contains("WALL")) {
+                                                    TileObject obj = t.getWallObject();
+                                                    if (obj != null && nameMatches.test(obj)) {
+                                                        candidates.add(createObjectData(obj, "WALL", baseX, baseY, plane, client, needle));
+                                                    }
+                                                }
+                                                if (kinds.contains("DECOR")) {
+                                                    TileObject obj = t.getDecorativeObject();
+                                                    if (obj != null && nameMatches.test(obj)) {
+                                                        candidates.add(createObjectData(obj, "DECOR", baseX, baseY, plane, client, needle));
+                                                    }
+                                                }
+                                                if (kinds.contains("GROUND")) {
+                                                    TileObject obj = t.getGroundObject();
+                                                    if (obj != null && nameMatches.test(obj)) {
+                                                        candidates.add(createObjectData(obj, "GROUND", baseX, baseY, plane, client, needle));
+                                                    }
+                                                }
+                                                if (kinds.contains("GAME")) {
+                                                    final GameObject[] arr = t.getGameObjects();
+                                                    if (arr != null) {
+                                                        for (GameObject go : arr) {
+                                                            if (go != null && nameMatches.test(go)) {
+                                                                candidates.add(createObjectData(go, "GAME", baseX, baseY, plane, client, needle));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        if (candidates.isEmpty()) {
+                                            resp.put("ok", true);
+                                            resp.put("found", false);
+                                            resp.put("object", null);
+                                        } else {
+                                            // Find object with shortest path
+                                            java.util.Map<String,Object> bestObject = null;
+                                            int shortestPathLength = Integer.MAX_VALUE;
+                                            
+                                            for (java.util.Map<String,Object> candidate : candidates) {
+                                                @SuppressWarnings("unchecked")
+                                                java.util.Map<String,Object> world = (java.util.Map<String,Object>) candidate.get("world");
+                                                int objWx = (Integer) world.get("x");
+                                                int objWy = (Integer) world.get("y");
+                                                
+                                                // Compute path to this object
+                                                PathResult pathResult = computePathTowardScene(objWx, objWy);
+                                                if (pathResult != null && pathResult.path != null && !pathResult.path.isEmpty()) {
+                                                    int pathLength = pathResult.path.size();
+                                                    if (pathLength < shortestPathLength) {
+                                                        shortestPathLength = pathLength;
+                                                        bestObject = candidate;
+                                                        bestObject.put("pathLength", pathLength);
+                                                        bestObject.put("pathFound", true);
+                                                    }
+                                                } else {
+                                                    // If pathfinding fails, fall back to raw distance
+                                                    int rawDistance = (Integer) candidate.getOrDefault("distance", Integer.MAX_VALUE);
+                                                    if (rawDistance < shortestPathLength) {
+                                                        shortestPathLength = rawDistance;
+                                                        bestObject = candidate;
+                                                        bestObject.put("pathLength", rawDistance);
+                                                        bestObject.put("pathFound", false);
+                                                    }
+                                                }
+                                            }
+                                            
+                                            if (bestObject != null) {
+                                                resp.put("ok", true);
+                                                resp.put("found", true);
+                                                resp.put("object", bestObject);
+                                            } else {
+                                                resp.put("ok", true);
+                                                resp.put("found", false);
+                                                resp.put("object", null);
+                                            }
+                                        }
+
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false); resp.put("err", "find-object-by-path-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(500, java.util.concurrent.TimeUnit.MILLISECONDS); // Longer timeout for pathfinding
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_object_at_tile": {
+                                final int targetX = cmd.x;
+                                final int targetY = cmd.y;
+                                final int targetPlane = (cmd.plane != null) ? cmd.plane : client.getPlane();
+                                final String needle = (cmd.name == null ? "" : cmd.name.trim().toLowerCase());
+
+                                // which object kinds to include
+                                final java.util.Set<String> kinds = new java.util.HashSet<>();
+                                if (cmd.types != null) {
+                                    for (String t : cmd.types) if (t != null) kinds.add(t.trim().toUpperCase());
+                                }
+                                if (kinds.isEmpty()) {
+                                    kinds.add("GAME");
+                                    kinds.add("WALL");
+                                    kinds.add("DECOR");
+                                    kinds.add("GROUND");
+                                }
+
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        final Player me = client.getLocalPlayer();
+                                        final Scene scene = client.getScene();
+                                        if (me == null || scene == null) { 
+                                            resp.put("ok", false); resp.put("err", "no-player-or-scene"); 
+                                            fut.complete(resp); return; 
+                                        }
+
+                                        final int plane = client.getPlane();
+                                        final int baseX = client.getBaseX(), baseY = client.getBaseY();
+                                        
+                                        // Convert world coordinates to local coordinates
+                                        final int lx = targetX - baseX;
+                                        final int ly = targetY - baseY;
+                                        
+                                        // Check if target tile is in scene bounds
+                                        if (lx < 0 || lx >= 104 || ly < 0 || ly >= 104 || targetPlane != plane) {
+                                            resp.put("ok", false); resp.put("err", "tile-out-of-scene"); 
+                                            fut.complete(resp); return;
+                                        }
+
+                                        final Tile[][][] tiles = scene.getTiles();
+                                        if (tiles == null || plane < 0 || plane >= tiles.length || tiles[plane] == null) {
+                                            resp.put("ok", false); resp.put("err", "no-tiles"); 
+                                            fut.complete(resp); return;
+                                        }
+
+                                        final Tile targetTile = tiles[plane][lx][ly];
+                                        if (targetTile == null) {
+                                            resp.put("ok", false); resp.put("err", "no-tile"); 
+                                            fut.complete(resp); return;
+                                        }
+
+                                        final java.util.List<java.util.Map<String,Object>> objects = new java.util.ArrayList<>();
+
+                                        // Check all object types on this tile
+                                        if (kinds.contains("GAME")) {
+                                            final GameObject[] gameObjects = targetTile.getGameObjects();
+                                            if (gameObjects != null) {
+                                                for (GameObject obj : gameObjects) {
+                                                    if (obj != null) {
+                                                        java.util.Map<String,Object> objData = createObjectData(obj, "GAME", baseX, baseY, plane, client, needle);
+                                                        if (objData != null) {
+                                                            objects.add(objData);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        if (kinds.contains("WALL")) {
+                                            final WallObject wallObject = targetTile.getWallObject();
+                                            if (wallObject != null) {
+                                                java.util.Map<String,Object> objData = createObjectData(wallObject, "WALL", baseX, baseY, plane, client, needle);
+                                                if (objData != null) {
+                                                    objects.add(objData);
+                                                }
+                                            }
+                                        }
+
+                                        if (kinds.contains("DECOR")) {
+                                            final DecorativeObject decorativeObject = targetTile.getDecorativeObject();
+                                            if (decorativeObject != null) {
+                                                java.util.Map<String,Object> objData = createObjectData(decorativeObject, "DECOR", baseX, baseY, plane, client, needle);
+                                                if (objData != null) {
+                                                    objects.add(objData);
+                                                }
+                                            }
+                                        }
+
+                                        if (kinds.contains("GROUND")) {
+                                            final GroundObject groundObject = targetTile.getGroundObject();
+                                            if (groundObject != null) {
+                                                java.util.Map<String,Object> objData = createObjectData(groundObject, "GROUND", baseX, baseY, plane, client, needle);
+                                                if (objData != null) {
+                                                    objects.add(objData);
+                                                }
+                                            }
+                                        }
+
+                                        resp.put("ok", true);
+                                        resp.put("objects", objects);
+                                        resp.put("count", objects.size());
+
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false); resp.put("err", "get-object-at-tile-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "find_object_in_area": {
+                                final String needle = (cmd.name == null ? "" : cmd.name.trim().toLowerCase());
+                                final int minX = cmd.minX;
+                                final int maxX = cmd.maxX;
+                                final int minY = cmd.minY;
+                                final int maxY = cmd.maxY;
+                                final String objectType = (cmd.types != null && !cmd.types.isEmpty()) ? cmd.types.get(0).trim().toUpperCase() : "GAME";
+
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        final Player me = client.getLocalPlayer();
+                                        final Scene scene = client.getScene();
+                                        if (me == null || scene == null) { 
+                                            resp.put("ok", false); resp.put("err", "no-player-or-scene"); 
+                                            fut.complete(resp); return; 
+                                        }
+
+                                        final int plane = client.getPlane();
+                                        final int baseX = client.getBaseX(), baseY = client.getBaseY();
+                                        final int myWx = me.getWorldLocation().getX();
+                                        final int myWy = me.getWorldLocation().getY();
+
+                                        final Tile[][][] tiles = scene.getTiles();
+                                        if (tiles == null || plane < 0 || plane >= tiles.length || tiles[plane] == null) {
+                                            resp.put("ok", false); resp.put("err", "no-tiles"); 
+                                            fut.complete(resp); return;
+                                        }
+
+                                        // Helper to check if object matches name early
+                                        java.util.function.Predicate<TileObject> nameMatches = (obj) -> {
+                                            if (obj == null) return false;
+                                            final int id = obj.getId();
+                                            final ObjectComposition comp = client.getObjectDefinition(id);
+                                            String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
+                                            
+                                            // Check for impostor IDs if name is null or empty
+                                            if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
+                                                int[] impostorIds = comp.getImpostorIds();
+                                                if (impostorIds != null && impostorIds.length > 0) {
+                                                    for (int impostorId : impostorIds) {
+                                                        if (impostorId != -1) {
+                                                            ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
+                                                            if (impostorComp != null) {
+                                                                String impostorName = impostorComp.getName();
+                                                                if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
+                                                                    nm = impostorName;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            
+                                            final String nmLower = nm.toLowerCase();
+                                            if (needle.isEmpty()) return true;
+                                            
+                                            // For "tree", be more specific - avoid gates, doors, etc.
+                                            if ("tree".equals(needle)) {
+                                                return nmLower.equals("tree") || 
+                                                       nmLower.startsWith("tree ") || 
+                                                       nmLower.endsWith(" tree") ||
+                                                       (nmLower.contains("tree") && !nmLower.contains("gate") && !nmLower.contains("door"));
+                                            }
+                                            
+                                            // For other objects, use normal matching
+                                            return nmLower.equals(needle) || nmLower.contains(needle);
+                                        };
+
+                                        // Convert area bounds to local coordinates
+                                        final int minLx = Math.max(0, minX - baseX);
+                                        final int maxLx = Math.min(103, maxX - baseX);
+                                        final int minLy = Math.max(0, minY - baseY);
+                                        final int maxLy = Math.min(103, maxY - baseY);
+                                        
+                                        java.util.List<java.util.Map<String,Object>> candidates = new java.util.ArrayList<>();
+                                        
+                                        // Scan only the specified area
+                                        for (int lx = minLx; lx <= maxLx; lx++) {
+                                            for (int ly = minLy; ly <= maxLy; ly++) {
+                                                final Tile t = tiles[plane][lx][ly];
+                                                if (t == null) continue;
+
+                                                TileObject obj = null;
+                                                if ("WALL".equals(objectType)) obj = t.getWallObject();
+                                                else if ("DECOR".equals(objectType)) obj = t.getDecorativeObject();
+                                                else if ("GROUND".equals(objectType)) obj = t.getGroundObject();
+                                                else if ("GAME".equals(objectType)) {
+                                                    final GameObject[] arr = t.getGameObjects();
+                                                    if (arr != null) {
+                                                        for (GameObject go : arr) {
+                                                            if (go != null && nameMatches.test(go)) {
+                                                                obj = go;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                if (obj != null && nameMatches.test(obj)) {
+                                                    // Add to candidates list for later selection
+                                                    final int id = obj.getId();
+                                                    final ObjectComposition comp = client.getObjectDefinition(id);
+                                                    String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
+                                                    String[] actions = null;
+                                                    
+                                                    // Handle impostor IDs
+                                                    if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
+                                                        int[] impostorIds = comp.getImpostorIds();
+                                                        if (impostorIds != null && impostorIds.length > 0) {
+                                                            for (int impostorId : impostorIds) {
+                                                                if (impostorId != -1) {
+                                                                    ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
+                                                                    if (impostorComp != null) {
+                                                                        String impostorName = impostorComp.getName();
+                                                                        if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
+                                                                            nm = impostorName;
+                                                                            actions = impostorComp.getActions();
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    } else if (comp != null) {
+                                                        actions = comp.getActions();
+                                                    }
+
+                                                    final int wx = baseX + obj.getLocalLocation().getSceneX();
+                                                    final int wy = baseY + obj.getLocalLocation().getSceneY();
+                                                    final int distance = Math.abs(wx - myWx) + Math.abs(wy - myWy);
+
+                                                    final java.util.Map<String,Object> objData = new java.util.LinkedHashMap<>();
+                                                    objData.put("id", id);
+                                                    objData.put("type", objectType);
+                                                    objData.put("name", nm);
+                                                    objData.put("world", java.util.Map.of("x", wx, "y", wy, "p", plane));
+                                                    objData.put("distance", distance);
+                                                    objData.put("exactMatch", nm.toLowerCase().equals(needle));
+
+                                                    if (actions != null) {
+                                                        java.util.List<String> al = new java.util.ArrayList<>();
+                                                        for (String a : actions) if (a != null) al.add(a);
+                                                        objData.put("actions", al);
+                                                    }
+
+                                                    // Get bounds/canvas position
+                                                    try {
+                                                        final java.awt.Shape hull = (obj instanceof GameObject) ? ((GameObject)obj).getConvexHull()
+                                                                : (obj instanceof DecorativeObject) ? ((DecorativeObject)obj).getConvexHull()
+                                                                : (obj instanceof WallObject) ? ((WallObject)obj).getConvexHull()
+                                                                : (obj instanceof GroundObject) ? ((GroundObject)obj).getConvexHull()
+                                                                : null;
+                                                        if (hull != null) {
+                                                            final java.awt.Rectangle rb = hull.getBounds();
+                                                            if (rb != null) {
+                                                                objData.put("bounds", java.util.Map.of(
+                                                                        "x", rb.x, "y", rb.y, "width", rb.width, "height", rb.height));
+                                                                objData.put("canvas", java.util.Map.of(
+                                                                        "x", rb.x + rb.width/2, "y", rb.y + rb.height/2));
+                                                                objData.put("orientation", (rb.width > rb.height) ? "horizontal" : "vertical");
+                                                            }
+                                                        }
+                                                    } catch (Exception ignored) {}
+
+                                                    // Fallback: tile center projection
+                                                    try {
+                                                        final LocalPoint lp = LocalPoint.fromWorld(client, wx, wy);
+                                                        if (lp != null) {
+                                                            final net.runelite.api.Point pt = Perspective.localToCanvas(client, lp, plane);
+                                                            if (pt != null) objData.put("tileCanvas", java.util.Map.of("x", pt.getX(), "y", pt.getY()));
+                                                        }
+                                                    } catch (Exception ignored) {}
+
+                                                    candidates.add(objData);
+                                                }
+                                            }
+                                        }
+
+                                        // Select best candidate: prioritize exact matches, then closest distance
+                                        if (candidates.isEmpty()) {
+                                            resp.put("ok", true);
+                                            resp.put("found", false);
+                                            resp.put("object", null);
+                                        } else {
+                                            // Sort candidates: exact matches first, then by distance
+                                            candidates.sort((a, b) -> {
+                                                boolean aExact = (Boolean) a.getOrDefault("exactMatch", false);
+                                                boolean bExact = (Boolean) b.getOrDefault("exactMatch", false);
+                                                
+                                                if (aExact && !bExact) return -1;  // a is exact, b is not
+                                                if (!aExact && bExact) return 1;   // b is exact, a is not
+                                                
+                                                // Both same type (exact or not), sort by distance
+                                                int aDist = (Integer) a.getOrDefault("distance", Integer.MAX_VALUE);
+                                                int bDist = (Integer) b.getOrDefault("distance", Integer.MAX_VALUE);
+                                                return Integer.compare(aDist, bDist);
+                                            });
+
+                                            resp.put("ok", true);
+                                            resp.put("found", true);
+                                            resp.put("object", candidates.get(0));
+                                        }
+
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false); resp.put("err", "find-object-in-area-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "find_npc": {
+                                final String needle = (cmd.name == null ? "" : cmd.name.trim().toLowerCase());
+                                final int radius = (cmd.radius == null) ? 26 : Math.max(1, cmd.radius);
+
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        final Player me = client.getLocalPlayer();
+                                        final Scene scene = client.getScene();
+                                        if (me == null || scene == null) { 
+                                            resp.put("ok", false); resp.put("err", "no-player-or-scene"); 
+                                            fut.complete(resp); return; 
+                                        }
+
+                                        final int plane = client.getPlane();
+                                        final int baseX = client.getBaseX(), baseY = client.getBaseY();
+                                        final int myWx = me.getWorldLocation().getX();
+                                        final int myWy = me.getWorldLocation().getY();
+                                        final int minWx = myWx - radius, maxWx = myWx + radius;
+                                        final int minWy = myWy - radius, maxWy = myWy + radius;
+
+                                        // Get all NPCs from the client
+                                        final java.util.List<NPC> npcs = client.getNpcs();
+                                        if (npcs == null) { 
+                                            resp.put("ok", true); resp.put("found", false); resp.put("npc", null);
+                                            fut.complete(resp); return; 
+                                        }
+
+                                        // Collect all matching NPCs and find the closest one
+                                        java.util.List<java.util.Map<String,Object>> candidates = new java.util.ArrayList<>();
+                                        
+                                        for (NPC npc : npcs) {
+                                            if (npc == null) continue;
+
+                                            // Get NPC composition for name and actions
+                                            final NPCComposition comp = client.getNpcDefinition(npc.getId());
+                                            final String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
+                                            final String nmLower = nm.toLowerCase();
+                                            if (!needle.isEmpty() && !nmLower.contains(needle)) continue;
+
+                                            // Get world coordinates
+                                            final int wx = npc.getWorldLocation().getX();
+                                            final int wy = npc.getWorldLocation().getY();
+                                            if (wx < minWx || wx > maxWx || wy < minWy || wy > maxWy) continue;
+
+                                            // Build NPC data
+                                            final java.util.Map<String,Object> npcData = new java.util.LinkedHashMap<>();
+                                            npcData.put("type", "NPC");
+                                            npcData.put("id", npc.getId());
+                                            npcData.put("name", nm);
+                                            npcData.put("actions", (comp != null) ? comp.getActions() : null);
+                                            npcData.put("world", java.util.Map.of("x", wx, "y", wy, "p", plane));
+                                            npcData.put("distance", Math.abs(wx - myWx) + Math.abs(wy - myWy));
+                                            
+                                            // Add combat status
+                                            Actor interacting = npc.getInteracting();
+                                            boolean inCombat = (interacting != null);
+                                            npcData.put("inCombat", inCombat);
+                                            if (inCombat) {
+                                                npcData.put("combatTarget", interacting.getName());
+                                                npcData.put("combatTargetType", interacting instanceof Player ? "Player" : "NPC");
+                                            }
+
+                                            // Get canvas position from convex hull if available
+                                            try {
+                                                final java.awt.Shape hull = npc.getConvexHull();
+                                                if (hull != null) {
+                                                    final java.awt.Rectangle rb = hull.getBounds();
+                                                    if (rb != null) {
+                                                        npcData.put("bounds", java.util.Map.of(
+                                                                "x", rb.x, "y", rb.y, "width", rb.width, "height", rb.height));
+                                                        npcData.put("canvas", java.util.Map.of(
+                                                                "x", rb.x + rb.width/2, "y", rb.y + rb.height/2));
+                                                        npcData.put("orientation", (rb.width > rb.height) ? "horizontal" : "vertical");
+                                                    }
+                                                }
+                                            } catch (Exception ignored) {}
+
+                                            // Fallback: tile center projection
+                                            try {
+                                                final LocalPoint lp = LocalPoint.fromWorld(client, wx, wy);
+                                                if (lp != null) {
+                                                    final net.runelite.api.Point pt = Perspective.localToCanvas(client, lp, plane);
+                                                    if (pt != null) npcData.put("tileCanvas", java.util.Map.of("x", pt.getX(), "y", pt.getY()));
+                                                }
+                                            } catch (Exception ignored) {}
+
+                                            candidates.add(npcData);
+                                        }
+                                        
+                                        // Select closest NPC
+                                        if (candidates.isEmpty()) {
+                                            resp.put("ok", true);
+                                            resp.put("found", false);
+                                            resp.put("npc", null);
+                                        } else {
+                                            // Sort by distance and return closest
+                                            candidates.sort((a, b) -> {
+                                                int aDist = (Integer) a.getOrDefault("distance", Integer.MAX_VALUE);
+                                                int bDist = (Integer) b.getOrDefault("distance", Integer.MAX_VALUE);
+                                                return Integer.compare(aDist, bDist);
+                                            });
+                                            
+                                            resp.put("ok", true);
+                                            resp.put("found", true);
+                                            resp.put("npc", candidates.get(0));
+                                        }
+
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false); resp.put("err", "find-npc-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "scan_scene": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        final Player me = client.getLocalPlayer();
+                                        if (me == null) {
+                                            resp.put("ok", false); resp.put("err", "no-player");
+                                            fut.complete(resp); return;
+                                        }
+
+                                        final int plane = client.getPlane();
+                                        final int baseX = client.getBaseX(), baseY = client.getBaseY();
+                                        
+                                        // Use RuneLite's existing collision system
+                                        var cms = client.getCollisionMaps();
+                                        if (cms == null || plane < 0 || plane >= cms.length || cms[plane] == null) {
+                                            resp.put("ok", false); resp.put("err", "no-collision-maps");
+                                            fut.complete(resp); return;
+                                        }
+                                        
+                                        int[][] flags = cms[plane].getFlags();
+                                        
+                                        // Scan the current 104x104 scene for collision data using RuneLite's collision flags
+                                        java.util.List<java.util.Map<String,Object>> collisionData = new java.util.ArrayList<>();
+                                        
+                                        for (int lx = 0; lx < 104; lx++) {
+                                            for (int ly = 0; ly < 104; ly++) {
+                                                final int worldX = baseX + lx;
+                                                final int worldY = baseY + ly;
+                                                
+                                                // Get collision flags from CollisionDataFlag
+                                                int tileFlags = client.getCollisionMaps()[plane].getFlags()[lx][ly];
+                                                
+                                                // Skip scene boundary tiles that have all flags set (0x00FFFFFF)
+                                                // These are not real collision data but scene boundaries
+                                                if (tileFlags == 0x00FFFFFF) {
+                                                    continue;
+                                                }
+                                                
+                                                // Detect doors, ladders using object actions
+                                                java.util.Map<String,Object> doorInfo = null;
+                                                boolean ladderUp = false;
+                                                boolean ladderDown = false;
+                                                
+                                                try {
+                                                    final Scene scene = client.getScene();
+                                                    if (scene != null) {
+                                                        final Tile[][][] tiles = scene.getTiles();
+                                                        if (tiles != null && plane < tiles.length && tiles[plane] != null) {
+                                                            final Tile tile = tiles[plane][lx][ly];
+                                                            if (tile != null) {
+                                                                // Check WallObject for doors
+                                                                WallObject wallObj = tile.getWallObject();
+                                                                if (wallObj != null) {
+                                                                    try {
+                                                                        ObjectComposition comp = client.getObjectDefinition(wallObj.getId());
+                                                                        if (comp != null) {
+                                                                            String[] actions = comp.getActions();
+                                                                            if (actions != null) {
+                                                                                for (String action : actions) {
+                                                                                    if (action != null) {
+                                                                                        String actionLower = action.toLowerCase();
+                                                                                        if (actionLower.contains("open") || actionLower.contains("close")) {
+                                                                                            // Create door info in old format
+                                                                                            doorInfo = new java.util.LinkedHashMap<>();
+                                                                                            doorInfo.put("id", wallObj.getId());
+                                                                                            doorInfo.put("passable", false);
+                                                                                            doorInfo.put("actions", actions);
+                                                                                            doorInfo.put("orientationA", wallObj.getOrientationA());
+                                                                                            doorInfo.put("orientationB", wallObj.getOrientationB());
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    } catch (Exception ignored) {}
+                                                                }
+                                                                
+                                                                // Check GameObjects for ladders
+                                                                GameObject[] gameObjects = tile.getGameObjects();
+                                                                if (gameObjects != null) {
+                                                                    for (GameObject gameObj : gameObjects) {
+                                                                        if (gameObj != null) {
+                                                                            try {
+                                                                                ObjectComposition comp = client.getObjectDefinition(gameObj.getId());
+                                                                                if (comp != null) {
+                                                                                    String[] actions = comp.getActions();
+                                                                                    if (actions != null) {
+                                                                                        for (String action : actions) {
+                                                                                            if (action != null) {
+                                                                                                String actionLower = action.toLowerCase();
+                                                                                                if (actionLower.contains("climb-up") || actionLower.contains("climb up")) {
+                                                                                                    ladderUp = true;
+                                                                                                }
+                                                                                                if (actionLower.contains("climb-down") || actionLower.contains("climb down")) {
+                                                                                                    ladderDown = true;
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            } catch (Exception ignored) {}
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                } catch (Exception ignored) {}
+                                                
+                                                // Emit all tiles with collision data
+                                                java.util.Map<String,Object> tileData = new java.util.LinkedHashMap<>();
+                                                tileData.put("x", worldX);
+                                                tileData.put("y", worldY);
+                                                tileData.put("p", plane);
+                                                tileData.put("flags", tileFlags);
+                                                if (doorInfo != null) {
+                                                    tileData.put("door", doorInfo);
+                                                }
+                                                tileData.put("ladderUp", ladderUp);
+                                                tileData.put("ladderDown", ladderDown);
+                                                
+                                                collisionData.add(tileData);
+                                            }
+                                        }
+
+                                        resp.put("ok", true);
+                                        resp.put("baseX", baseX);
+                                        resp.put("baseY", baseY);
+                                        resp.put("plane", plane);
+                                        resp.put("collisionData", collisionData);
+                                        resp.put("count", collisionData.size());
+
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false); resp.put("err", "scan-scene-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "detect_water": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        final Player me = client.getLocalPlayer();
+                                        if (me == null) {
+                                            resp.put("ok", false); resp.put("err", "no-player");
+                                            fut.complete(resp); return;
+                                        }
+
+                                        final int plane = client.getPlane();
+                                        final int baseX = client.getBaseX(), baseY = client.getBaseY();
+                                        
+                                        // Use RuneLite's collision system to detect water
+                                        var cms = client.getCollisionMaps();
+                                        if (cms == null || plane < 0 || plane >= cms.length || cms[plane] == null) {
+                                            resp.put("ok", false); resp.put("err", "no-collision-maps");
+                                            fut.complete(resp); return;
+                                        }
+                                        
+                                        int[][] flags = cms[plane].getFlags();
+                                        
+                                        // Detect water regions using collision flags
+                                        java.util.List<java.util.Map<String,Object>> waterRegions = new java.util.ArrayList<>();
+                                        boolean[][] visited = new boolean[104][104];
+                                        
+                                        for (int lx = 0; lx < 104; lx++) {
+                                            for (int ly = 0; ly < 104; ly++) {
+                                                if (visited[lx][ly]) continue;
+                                                
+                                                // Check if this tile is water using collision flags
+                                                int f = flags[lx][ly];
+                                                boolean isWater = (f & 0x100) != 0; // Water collision flag
+                                                
+                                                if (!isWater) continue;
+                                                
+                                                // Flood fill to find connected water region
+                                                java.util.List<java.util.Map<String,Object>> region = new java.util.ArrayList<>();
+                                                java.util.Queue<int[]> queue = new java.util.LinkedList<>();
+                                                queue.offer(new int[]{lx, ly});
+                                                
+                                                while (!queue.isEmpty()) {
+                                                    int[] current = queue.poll();
+                                                    int cx = current[0], cy = current[1];
+                                                    
+                                                    if (visited[cx][cy] || cx < 0 || cx >= 104 || cy < 0 || cy >= 104) continue;
+                                                    
+                                                    int cf = flags[cx][cy];
+                                                    boolean isWaterTile = (cf & 0x100) != 0;
+                                                    if (!isWaterTile) continue;
+                                                    
+                                                    visited[cx][cy] = true;
+                                                    region.add(java.util.Map.of(
+                                                        "x", baseX + cx,
+                                                        "y", baseY + cy,
+                                                        "p", plane
+                                                    ));
+                                                    
+                                                    // Add neighbors
+                                                    queue.offer(new int[]{cx + 1, cy});
+                                                    queue.offer(new int[]{cx - 1, cy});
+                                                    queue.offer(new int[]{cx, cy + 1});
+                                                    queue.offer(new int[]{cx, cy - 1});
+                                                }
+                                                
+                                                if (region.size() > 0) {
+                                                    waterRegions.add(java.util.Map.of(
+                                                        "region", region,
+                                                        "size", region.size()
+                                                    ));
+                                                }
+                                            }
+                                        }
+
+                                        resp.put("ok", true);
+                                        resp.put("baseX", baseX);
+                                        resp.put("baseY", baseY);
+                                        resp.put("plane", plane);
+                                        resp.put("waterRegions", waterRegions);
+                                        resp.put("count", waterRegions.size());
+
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false); resp.put("err", "detect-water-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "hovered": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        Tile hoveredTile = client.getSelectedSceneTile();
+                                        if (hoveredTile != null) {
+                                            java.util.Map<String,Object> tileInfo = new java.util.LinkedHashMap<>();
+                                            WorldPoint worldPos = hoveredTile.getWorldLocation();
+                                            tileInfo.put("worldX", worldPos.getX());
+                                            tileInfo.put("worldY", worldPos.getY());
+                                            tileInfo.put("plane", worldPos.getPlane());
+
+                                            // Get canvas position
+                                            try {
+                                                LocalPoint lp = LocalPoint.fromWorld(client, worldPos.getX(), worldPos.getY());
+                                                if (lp != null) {
+                                                    net.runelite.api.Point pt = Perspective.localToCanvas(client, lp, worldPos.getPlane());
+                                                    if (pt != null) {
+                                                        tileInfo.put("canvasX", pt.getX());
+                                                        tileInfo.put("canvasY", pt.getY());
+                                                    }
+                                                }
+                                            } catch (Exception ignored) {}
+
+                                            // Game objects on hovered tile
+                                            GameObject[] hoveredObjects = hoveredTile.getGameObjects();
+                                            java.util.List<java.util.Map<String,Object>> gameObjects = new java.util.ArrayList<>();
+
+                                            for (int i = 0; i < hoveredObjects.length; i++) {
+                                                GameObject object = hoveredObjects[i];
+                                                if (object != null) {
+                                                    java.util.Map<String,Object> objInfo = new java.util.LinkedHashMap<>();
+                                                    objInfo.put("index", i);
+                                                    objInfo.put("id", object.getId());
+
+                                                    try {
+                                                        ObjectComposition objDef = client.getObjectDefinition(object.getId());
+                                                        objInfo.put("name", objDef.getName());
+                                                        objInfo.put("actions", objDef.getActions());
+                                                    } catch (Exception e) {
+                                                        objInfo.put("name", "Unknown");
+                                                        objInfo.put("actions", new String[0]);
+                                                    }
+
+                                                    WorldPoint objectPos = object.getWorldLocation();
+                                                    objInfo.put("worldX", objectPos.getX());
+                                                    objInfo.put("worldY", objectPos.getY());
+                                                    objInfo.put("plane", objectPos.getPlane());
+
+                                                    try {
+                                                        net.runelite.api.Point canvasPos = object.getCanvasLocation();
+                                                        objInfo.put("canvasX", canvasPos.getX());
+                                                        objInfo.put("canvasY", canvasPos.getY());
+                                                    } catch (Exception ignored) {}
+
+                                                    try {
+                                                        java.awt.Rectangle objectRect = object.getClickbox().getBounds();
+                                                        java.util.Map<String,Object> clickbox = new java.util.LinkedHashMap<>();
+                                                        clickbox.put("x", objectRect.x);
+                                                        clickbox.put("y", objectRect.y);
+                                                        clickbox.put("width", objectRect.width);
+                                                        clickbox.put("height", objectRect.height);
+                                                        objInfo.put("clickbox", clickbox);
+                                                    } catch (Exception e) {
+                                                        objInfo.put("clickbox", null);
+                                                    }
+
+                                                    gameObjects.add(objInfo);
+                                                }
+                                            }
+
+                                            tileInfo.put("gameObjects", gameObjects);
+                                            resp.put("ok", true);
+                                            resp.put("hoveredTile", tileInfo);
+                                        } else {
+                                            resp.put("ok", true);
+                                            resp.put("hoveredTile", null);
+                                        }
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "hovered-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "tab": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Map tab indices to names
+                                        final String[] tabNames = {
+                                            "COMBAT", "SKILLS", "QUESTS", "INVENTORY", "EQUIPMENT", 
+                                            "PRAYER", "SPELLBOOK", "CHAT-CHANNEL", "ACCOUNT_MANAGEMENT", "FRIENDS_LIST", 
+                                            "SETTINGS", "EMOTES", "MUSIC"
+                                        };
+                                        
+                                        // Check which tab is selected by checking STONE widget SpriteId
+                                        int currentTab = -1; // Unknown by default
+                                        
+                                        // Check SIDE_MOVABLE STONE widgets (0-6): STONE0 through STONE6
+                                        // These correspond to tabs 0-6
+                                        if (client.getWidget(164, 52) != null && !client.getWidget(164, 52).isHidden() && client.getWidget(164, 52).getSpriteId() == 1181) { // STONE0 - COMBAT
+                                            currentTab = 0;
+                                        } else if (client.getWidget(164, 53) != null && !client.getWidget(164, 53).isHidden() && client.getWidget(164, 53).getSpriteId() == 1181) { // STONE1 - SKILLS
+                                            currentTab = 1;
+                                        } else if (client.getWidget(164, 54) != null && !client.getWidget(164, 54).isHidden() && client.getWidget(164, 54).getSpriteId() == 1181) { // STONE2 - QUESTS
+                                            currentTab = 2;
+                                        } else if (client.getWidget(164, 55) != null && !client.getWidget(164, 55).isHidden() && client.getWidget(164, 55).getSpriteId() == 1181) { // STONE3 - INVENTORY
+                                            currentTab = 3;
+                                        } else if (client.getWidget(164, 56) != null && !client.getWidget(164, 56).isHidden() && client.getWidget(164, 56).getSpriteId() == 1181) { // STONE4 - EQUIPMENT
+                                            currentTab = 4;
+                                        } else if (client.getWidget(164, 57) != null && !client.getWidget(164, 57).isHidden() && client.getWidget(164, 57).getSpriteId() == 1181) { // STONE5 - PRAYER
+                                            currentTab = 5;
+                                        } else if (client.getWidget(164, 58) != null && !client.getWidget(164, 58).isHidden() && client.getWidget(164, 58).getSpriteId() == 1181) { // STONE6 - SPELLBOOK
+                                            currentTab = 6;
+                                        }
+                                        // Check SIDE_STATIC STONE widgets (7-12): STONE7 through STONE13 (skip STONE10)
+                                        // These correspond to tabs 7-12
+                                        else if (client.getWidget(164, 38) != null && !client.getWidget(164, 38).isHidden() && client.getWidget(164, 38).getSpriteId() == 1181) { // STONE7 - CHAT-CHANNEL
+                                            currentTab = 7;
+                                        } else if (client.getWidget(164, 39) != null && !client.getWidget(164, 39).isHidden() && client.getWidget(164, 39).getSpriteId() == 1181) { // STONE8 - ACCOUNT MANAGEMENT
+                                            currentTab = 8;
+                                        } else if (client.getWidget(164, 40) != null && !client.getWidget(164, 40).isHidden() && client.getWidget(164, 40).getSpriteId() == 1181) { // STONE9 - FRIENDS LIST
+                                            currentTab = 9;
+                                        } else if (client.getWidget(164, 41) != null && !client.getWidget(164, 41).isHidden() && client.getWidget(164, 41).getSpriteId() == 1181) { // STONE11 - SETTINGS
+                                            currentTab = 10;
+                                        } else if (client.getWidget(164, 42) != null && !client.getWidget(164, 42).isHidden() && client.getWidget(164, 42).getSpriteId() == 1181) { // STONE12 - EMOTES
+                                            currentTab = 11;
+                                        } else if (client.getWidget(164, 43) != null && !client.getWidget(164, 43).isHidden() && client.getWidget(164, 43).getSpriteId() == 1181) { // STONE13 - MUSIC
+                                            currentTab = 12;
+                                        }
+                                        
+                                        // Add tab name mapping for better readability
+                                        String tabName = getTabName(currentTab);
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("tab", currentTab);
+                                        resp.put("tabName", tabName);
+                                        
+                                        // Get tab button coordinates dynamically
+                                        java.util.List<java.util.Map<String,Object>> tabs = new java.util.ArrayList<>();
+                                        
+                                        // Try to get actual tab coordinates from ToplevelPreEoc ICON widgets
+                                        try {
+                                            // Map tab indices to ToplevelPreEoc ICON widget IDs
+                                            // SIDE_MOVABLE (0-6): ICON0-ICON6 (164.59-164.65)
+                                            // SIDE_STATIC (7-12): ICON7-ICON13 (164.44-164.49, skip 164.50)
+                                            int[] tabWidgetIds = {
+                                                59, 60, 61, 62, 63, 64, 65,  // ICON0-ICON6 (0-6)
+                                                44, 45, 46, 47, 48, 49       // ICON7-ICON13 (7-12)
+                                            };
+                                            
+                                            for (int i = 0; i < tabWidgetIds.length && i < tabNames.length; i++) {
+                                                Widget tabWidget = client.getWidget(164, tabWidgetIds[i]);
+                                                if (tabWidget != null) {
+                                                    // Check if tab is visible (not hidden and has valid bounds)
+                                                    boolean isHidden = tabWidget.isHidden();
+                                                    java.awt.Rectangle bounds = tabWidget.getBounds();
+                                                    boolean hasValidBounds = (bounds != null && bounds.x >= 0 && bounds.y >= 0);
+                                                    
+                                                    // Only add visible tabs
+                                                    if (!isHidden && hasValidBounds) {
+                                                        java.util.Map<String,Object> tabInfo = new java.util.LinkedHashMap<>();
+                                                        tabInfo.put("index", i);
+                                                        tabInfo.put("name", tabNames[i]);
+                                                        tabInfo.put("bounds", java.util.Map.of(
+                                                                "x", bounds.x, "y", bounds.y, 
+                                                                "width", bounds.width, "height", bounds.height));
+                                                        tabInfo.put("canvas", java.util.Map.of(
+                                                                "x", bounds.x + bounds.width/2, 
+                                                                "y", bounds.y + bounds.height/2));
+                                                        tabs.add(tabInfo);
+                                                    }
+                                                }
+                                            }
+                                        } catch (Exception e) {
+                                            // Fallback if widget access fails
+                                        }
+                                        
+                                        // Only add tabs that are actually visible (have real coordinates)
+                                        // Don't add fallback tabs - only return what's actually visible
+                                        
+                                        resp.put("tabs", tabs);
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "tab-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
 
                             case "mask": {
                                 int r = (cmd.radius == null) ? 15 : Math.max(1, Math.min(30, cmd.radius));
@@ -788,6 +2717,7 @@ public class IpcInputPlugin extends Plugin
                                 final Integer rMinY = cmd.minY;
                                 final Integer rMaxY = cmd.maxY;
                                 final int maxWps = (cmd.maxWps != null) ? Math.max(1, cmd.maxWps) : 25;
+                                final boolean visualize = (cmd.visualize != null) ? cmd.visualize : true; // Default to true for backward compatibility
 
                                 // Optional label only for logs/overlay cosmetics
                                 final String label =
@@ -822,13 +2752,15 @@ public class IpcInputPlugin extends Plugin
                                 List<WorldPoint> full = (pr.path != null) ? pr.path : java.util.Collections.emptyList();
                                 PathDebug dbg = pr.debug;
 
-                                // Overlay (always show what we computed)
-                                final WorldPoint fStart = startWp;
-                                final WorldPoint fShownGoal = new WorldPoint(dbg.bestWx, dbg.bestWy, dbg.plane);
-                                final int fLen = full.size();
-                                clientThread.invokeLater(() -> {
-                                    pathOverlay.setPath(full, fStart, fShownGoal);
-                                });
+                                // Overlay (only show if visualize is true)
+                                if (visualize) {
+                                    final WorldPoint fStart = startWp;
+                                    final WorldPoint fShownGoal = new WorldPoint(dbg.bestWx, dbg.bestWy, dbg.plane);                                                                
+                                    final int fLen = full.size();
+                                    clientThread.invokeLater(() -> {
+                                        pathOverlay.setPath(full, fStart, fShownGoal);      
+                                    });
+                                }
 
                                 // Waypoints for client: consecutive tiles, capped by maxWps
                                 final int limit = Math.min(full.size(), Math.max(1, maxWps));
@@ -974,15 +2906,34 @@ public class IpcInputPlugin extends Plugin
                                     try {
                                         final java.awt.Component c = (java.awt.Component) client.getCanvas();
                                         if (c == null) { log.warn("[IPC] scroll: canvas null"); return; }
+                                        
+                                        // Get canvas center coordinates
+                                        final int centerX = c.getWidth() / 2;
+                                        final int centerY = c.getHeight() / 2;
+                                        
                                         long now = System.currentTimeMillis();
-                                        java.awt.event.MouseWheelEvent wheel = new java.awt.event.MouseWheelEvent(
-                                                c, java.awt.event.MouseEvent.MOUSE_WHEEL, now, 0,
-                                                c.getWidth()/2, c.getHeight()/2, 0, false,
-                                                java.awt.event.MouseWheelEvent.WHEEL_UNIT_SCROLL, Math.abs(amt),
-                                                (amt < 0) ? -1 : 1
+                                        
+                                        // First, simulate mouse movement to center of canvas
+                                        // This ensures the component "knows" the mouse is over it
+                                        java.awt.event.MouseEvent moveEvent = new java.awt.event.MouseEvent(
+                                                c, java.awt.event.MouseEvent.MOUSE_MOVED, now, 0,
+                                                centerX, centerY, 0, false
                                         );
-                                        log.info("[IPC] dispatch MouseWheelEvent rotations={} wheelRotation={}",
-                                                Math.abs(amt), ((amt < 0) ? -1 : 1));
+                                        c.dispatchEvent(moveEvent);
+                                        
+                                        // Small delay to ensure mouse move is processed
+                                        try { Thread.sleep(10); } catch (InterruptedException ignored) {}
+                                        
+                                        // Now dispatch the scroll event
+                                        // REVERSED: Positive amount = zoom IN, Negative amount = zoom OUT
+                                        java.awt.event.MouseWheelEvent wheel = new java.awt.event.MouseWheelEvent(
+                                                c, java.awt.event.MouseEvent.MOUSE_WHEEL, now + 20, 0,
+                                                centerX, centerY, 0, false,
+                                                java.awt.event.MouseWheelEvent.WHEEL_UNIT_SCROLL, Math.abs(amt),
+                                                (amt > 0) ? -1 : 1  // REVERSED: positive amt = -1 wheelRotation (zoom in)
+                                        );
+                                        log.info("[IPC] dispatch MouseWheelEvent at ({},{}) rotations={} wheelRotation={}",
+                                                centerX, centerY, Math.abs(amt), ((amt > 0) ? -1 : 1));
                                         c.dispatchEvent(wheel);
                                     } catch (Exception e) {
                                         log.warn("[IPC] scroll failed: {}", e.toString());
@@ -1006,6 +2957,2678 @@ public class IpcInputPlugin extends Plugin
                                 resp.put("ok", true);
                                 resp.put("player", playerName);
                                 out.println(gson.toJson(resp));
+                                break;
+                            }
+
+                            case "widget_exists": {
+                                Integer widgetId = cmd.widget_id;
+                                if (widgetId == null) {
+                                    out.println("{\"ok\":false,\"err\":\"need widget_id\"}");
+                                    break;
+                                }
+                                
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Try to get widget by ID (assuming it's a packed widget ID)
+                                        Widget widget = client.getWidget(widgetId);
+                                        boolean exists = (widget != null);
+                                        boolean visible = false;
+                                        
+                                        if (widget != null) {
+                                            // Check if widget is hidden
+                                            boolean isHidden = widget.isHidden();
+                                            
+                                            // Check bounds and coordinates
+                                            java.awt.Rectangle bounds = widget.getBounds();
+                                            boolean hasValidBounds = (bounds != null && bounds.x >= 0 && bounds.y >= 0);
+                                            
+                                            // Widget is visible only if not hidden AND has valid bounds
+                                            visible = !isHidden && hasValidBounds;
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("exists", exists);
+                                        resp.put("visible", visible);
+                                        resp.put("widget_id", widgetId);
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "widget-exists-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+                            
+                            case "get_widget": {
+                                Integer widgetId = cmd.widget_id;
+                                if (widgetId == null) {
+                                    out.println("{\"ok\":false,\"err\":\"need widget_id\"}");
+                                    break;
+                                }
+                                
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        Widget widget = client.getWidget(widgetId);
+                                        if (widget != null) {
+                                            java.util.Map<String,Object> widgetData = new java.util.LinkedHashMap<>();
+                                            widgetData.put("id", widgetId);
+                                            
+                                            // Get text safely
+                                            try {
+                                                String text = widget.getText();
+                                                widgetData.put("text", text != null ? text : "");
+                                            } catch (Exception ignored) {
+                                                widgetData.put("text", "");
+                                            }
+                                            
+                                            // Check visibility using bounds (like your existing code)
+                                            boolean visible = false;
+                                            java.awt.Rectangle bounds = null;
+                                            try {
+                                                bounds = widget.getBounds();
+                                                visible = (bounds != null);
+                                            } catch (Exception ignored) {}
+                                            
+                                            widgetData.put("visible", visible);
+                                            
+                                            // Get bounds if available
+                                            if (bounds != null) {
+                                                widgetData.put("bounds", java.util.Map.of(
+                                                        "x", bounds.x,
+                                                        "y", bounds.y,
+                                                        "width", bounds.width,
+                                                        "height", bounds.height
+                                                ));
+                                            }
+                                            
+                                            resp.put("ok", true);
+                                            resp.put("widget", widgetData);
+                                        } else {
+                                            resp.put("ok", false);
+                                            resp.put("err", "widget-not-found");
+                                        }
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-widget-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+                            
+                            case "get_widget_info": {
+                                Integer widgetId = cmd.widget_id;
+                                if (widgetId == null) {
+                                    out.println("{\"ok\":false,\"err\":\"need widget_id\"}");
+                                    break;
+                                }
+                                
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        Widget widget = client.getWidget(widgetId);
+                                        if (widget != null) {
+                                            java.util.Map<String,Object> widgetData = new java.util.LinkedHashMap<>();
+                                            widgetData.put("id", widgetId);
+                                            
+                            // Get text safely - try multiple methods for different widget types
+                            String text = "";
+                            try {
+                                // Try basic getText() first
+                                text = widget.getText();
+                                
+                                // If parent widget text is empty, check dynamic children first (most common case)
+                                if (text == null || text.isEmpty()) {
+                                    // Try dynamic children first (common for overlay text)
+                                    Widget[] dynamicChildren = widget.getDynamicChildren();
+                                    if (dynamicChildren != null) {
+                                        for (Widget child : dynamicChildren) {
+                                            if (child != null) {
+                                                String childText = child.getText();
+                                                if (childText != null && !childText.isEmpty() && !child.isHidden()) {
+                                                    text = childText;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // If still empty, try static children
+                                    if (text.isEmpty()) {
+                                        Widget[] children = widget.getStaticChildren();
+                                        if (children != null) {
+                                            for (Widget child : children) {
+                                                if (child != null) {
+                                                    String childText = child.getText();
+                                                    if (childText != null && !childText.isEmpty() && !child.isHidden()) {
+                                                        text = childText;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // If still empty, try getting text from parent widget
+                                    if (text.isEmpty()) {
+                                        Widget parent = widget.getParent();
+                                        if (parent != null) {
+                                            String parentText = parent.getText();
+                                            if (parentText != null && !parentText.isEmpty() && !parent.isHidden()) {
+                                                text = parentText;
+                                            }
+                                        }
+                                    }
+                                }
+                                                
+                                            } catch (Exception ignored) {
+                                                text = "";
+                                            }
+                                            widgetData.put("text", text != null ? text : "");
+                                            
+                                            // Get sprite ID safely
+                                            try {
+                                                int spriteId = widget.getSpriteId();
+                                                widgetData.put("spriteId", spriteId);
+                                            } catch (Exception ignored) {
+                                                widgetData.put("spriteId", -1);
+                                            }
+                                            
+                                            // Get OnOpListener safely
+                                            try {
+                                                Object onOpListener = widget.getOnOpListener();
+                                                widgetData.put("onOpListener", onOpListener);
+                                            } catch (Exception ignored) {
+                                                widgetData.put("onOpListener", null);
+                                            }
+                                            
+                                            // Get text color safely
+                                            try {
+                                                int textColor = widget.getTextColor();
+                                                widgetData.put("textColor", String.format("%x", textColor));
+                                            } catch (Exception ignored) {
+                                                widgetData.put("textColor", "");
+                                            }
+                                            
+                                            // Get other important properties
+                                            try {
+                                                widgetData.put("isIf3", widget.isIf3());
+                                                widgetData.put("hasListener", widget.hasListener());
+                                                widgetData.put("hidden", widget.isHidden());
+                                            } catch (Exception ignored) {
+                                                widgetData.put("isIf3", false);
+                                                widgetData.put("hasListener", false);
+                                                widgetData.put("hidden", true);
+                                            }
+                                            
+                                            // Check visibility properly: not hidden AND has valid bounds
+                                            boolean visible = false;
+                                            java.awt.Rectangle bounds = null;
+                                            try {
+                                                bounds = widget.getBounds();
+                                                boolean isHidden = widget.isHidden();
+                                                boolean hasValidBounds = (bounds != null && bounds.x >= 0 && bounds.y >= 0);
+                                                visible = !isHidden && hasValidBounds;
+                                            } catch (Exception ignored) {}
+                                            
+                                            widgetData.put("visible", visible);
+                                            
+                                            // Get bounds if available
+                                            if (bounds != null) {
+                                                widgetData.put("bounds", java.util.Map.of(
+                                                        "x", bounds.x,
+                                                        "y", bounds.y,
+                                                        "width", bounds.width,
+                                                        "height", bounds.height
+                                                ));
+                                            }
+                                            
+                                            // Determine section based on widget ID
+                                            String section = "unknown";
+                                            if (widgetId >= 44498948) {
+                                                section = "character_design";
+                                            } else if (widgetId >= 36569100 && widgetId <= 36569110) {
+                                                section = "tutorial";
+                                            }
+                                            
+                                            resp.put("ok", true);
+                                            resp.put("widget", widgetData);
+                                            resp.put("section", section);
+                                        } else {
+                                            resp.put("ok", false);
+                                            resp.put("err", "widget-not-found");
+                                        }
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-widget-info-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_widget_children": {
+                                Integer widgetId = cmd.widget_id;
+                                if (widgetId == null) {
+                                    out.println("{\"ok\":false,\"err\":\"need widget_id\"}");
+                                    break;
+                                }
+                                
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        Widget parentWidget = client.getWidget(widgetId);
+                                        if (parentWidget != null) {
+                                            java.util.List<java.util.Map<String,Object>> children = new java.util.ArrayList<>();
+                                            
+                                            // Get all child widgets recursively
+                                            collectChildWidgets(parentWidget, children);
+                                            
+                                            resp.put("ok", true);
+                                            resp.put("parent_id", widgetId);
+                                            resp.put("children", children);
+                                            resp.put("count", children.size());
+                                        } else {
+                                            resp.put("ok", false);
+                                            resp.put("err", "parent-widget-not-found");
+                                        }
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-widget-children-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_ge_prices": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get Grand Exchange offers directly from client
+                                        net.runelite.api.GrandExchangeOffer[] offers = client.getGrandExchangeOffers();
+                                        java.util.Map<String,Object> prices = new java.util.LinkedHashMap<>();
+                                        
+                                        if (offers != null) {
+                                            for (net.runelite.api.GrandExchangeOffer offer : offers) {
+                                                if (offer != null && offer.getItemId() > 0) {
+                                                    // Get item composition for name
+                                                    net.runelite.api.ItemComposition itemComp = client.getItemDefinition(offer.getItemId());
+                                                    if (itemComp != null) {
+                                                        String itemName = itemComp.getName();
+                                                        int price = offer.getPrice();
+                                                        if (price > 0) {
+                                                            prices.put(itemName, price);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("prices", prices);
+                                        resp.put("count", prices.size());
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-ge-prices-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_bank_items": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get bank items container (12.13) - widget ID: 786445
+                                        Widget itemsContainer = client.getWidget(786445);
+                                        if (itemsContainer != null) {
+                                            java.util.List<java.util.Map<String,Object>> items = new java.util.ArrayList<>();
+                                            collectChildWidgets(itemsContainer, items);
+                                            
+                                            resp.put("ok", true);
+                                            resp.put("items", items);
+                                        } else {
+                                            resp.put("ok", false);
+                                            resp.put("err", "bank-items-not-found");
+                                        }
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-bank-items-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(300, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_bank_tabs": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get bank tabs container (12.11) - widget ID: 786443
+                                        Widget tabsContainer = client.getWidget(786443);
+                                        if (tabsContainer != null) {
+                                            java.util.List<java.util.Map<String,Object>> tabs = new java.util.ArrayList<>();
+                                            collectChildWidgets(tabsContainer, tabs);
+                                            
+                                            resp.put("ok", true);
+                                            resp.put("tabs", tabs);
+                                        } else {
+                                            resp.put("ok", false);
+                                            resp.put("err", "bank-tabs-not-found");
+                                        }
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-bank-tabs-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_bank_quantity_buttons": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        java.util.List<java.util.Map<String,Object>> buttons = new java.util.ArrayList<>();
+                                        
+                                        // Get all quantity button containers
+                                        int[] quantityContainers = {30, 32, 34, 36, 38}; // 1, 5, 10, X, All
+                                        String[] buttonNames = {"quantity1", "quantity5", "quantity10", "quantityX", "quantityAll"};
+                                        
+                                        for (int i = 0; i < quantityContainers.length; i++) {
+                                            // Calculate widget ID: 786433 + quantityContainers[i]
+                                            Widget container = client.getWidget(786433 + quantityContainers[i]);
+                                            if (container != null) {
+                                                java.util.List<java.util.Map<String,Object>> containerButtons = new java.util.ArrayList<>();
+                                                collectChildWidgets(container, containerButtons);
+                                                
+                                                java.util.Map<String,Object> buttonGroup = new java.util.LinkedHashMap<>();
+                                                buttonGroup.put("name", buttonNames[i]);
+                                                buttonGroup.put("container_id", quantityContainers[i]);
+                                                buttonGroup.put("buttons", containerButtons);
+                                                buttons.add(buttonGroup);
+                                            }
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("quantity_buttons", buttons);
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-bank-quantity-buttons-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_bank_deposit_buttons": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        java.util.List<java.util.Map<String,Object>> buttons = new java.util.ArrayList<>();
+                                        
+                                        // Get deposit inventory button (12.44) - widget ID: 786477
+                                        Widget depositInv = client.getWidget(786477);
+                                        if (depositInv != null) {
+                                            java.util.Map<String,Object> buttonData = new java.util.LinkedHashMap<>();
+                                            buttonData.put("name", "deposit_inventory");
+                                            buttonData.put("id", depositInv.getId());
+                                            buttonData.put("text", depositInv.getText() != null ? depositInv.getText() : "");
+                                            
+                                            java.awt.Rectangle bounds = depositInv.getBounds();
+                                            if (bounds != null) {
+                                                buttonData.put("bounds", java.util.Map.of(
+                                                    "x", bounds.x, "y", bounds.y,
+                                                    "width", bounds.width, "height", bounds.height
+                                                ));
+                                                buttonData.put("visible", true);
+                                            } else {
+                                                buttonData.put("visible", false);
+                                            }
+                                            buttons.add(buttonData);
+                                        }
+                                        
+                                        // Get deposit equipment button (12.46) - widget ID: 786479
+                                        Widget depositEquip = client.getWidget(786479);
+                                        if (depositEquip != null) {
+                                            java.util.Map<String,Object> buttonData = new java.util.LinkedHashMap<>();
+                                            buttonData.put("name", "deposit_equipment");
+                                            buttonData.put("id", depositEquip.getId());
+                                            buttonData.put("text", depositEquip.getText() != null ? depositEquip.getText() : "");
+                                            
+                                            java.awt.Rectangle bounds = depositEquip.getBounds();
+                                            if (bounds != null) {
+                                                buttonData.put("bounds", java.util.Map.of(
+                                                    "x", bounds.x, "y", bounds.y,
+                                                    "width", bounds.width, "height", bounds.height
+                                                ));
+                                                buttonData.put("visible", true);
+                                            } else {
+                                                buttonData.put("visible", false);
+                                            }
+                                            buttons.add(buttonData);
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("deposit_buttons", buttons);
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-bank-deposit-buttons-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_bank_note_toggle": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get note toggle container (12.26) - widget ID: 786459
+                                        Widget noteContainer = client.getWidget(786459);
+                                        if (noteContainer != null) {
+                                            java.util.List<java.util.Map<String,Object>> toggles = new java.util.ArrayList<>();
+                                            collectChildWidgets(noteContainer, toggles);
+                                            
+                                            resp.put("ok", true);
+                                            resp.put("note_toggles", toggles);
+                                        } else {
+                                            resp.put("ok", false);
+                                            resp.put("err", "bank-note-toggle-not-found");
+                                        }
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-bank-note-toggle-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_bank_search": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        java.util.List<java.util.Map<String,Object>> searchWidgets = new java.util.ArrayList<>();
+                                        
+                                        // Get search container (12.42) - widget ID: 786475
+                                        Widget searchContainer = client.getWidget(786475);
+                                        if (searchContainer != null) {
+                                            java.util.Map<String,Object> searchData = new java.util.LinkedHashMap<>();
+                                            searchData.put("name", "search_box");
+                                            searchData.put("id", searchContainer.getId());
+                                            searchData.put("text", searchContainer.getText() != null ? searchContainer.getText() : "");
+                                            
+                                            java.awt.Rectangle bounds = searchContainer.getBounds();
+                                            if (bounds != null) {
+                                                searchData.put("bounds", java.util.Map.of(
+                                                    "x", bounds.x, "y", bounds.y,
+                                                    "width", bounds.width, "height", bounds.height
+                                                ));
+                                                searchData.put("visible", true);
+                                            } else {
+                                                searchData.put("visible", false);
+                                            }
+                                            searchWidgets.add(searchData);
+                                        }
+                                        
+                                        // Get search graphic (12.43) - widget ID: 786476
+                                        Widget searchGraphic = client.getWidget(786476);
+                                        if (searchGraphic != null) {
+                                            java.util.Map<String,Object> graphicData = new java.util.LinkedHashMap<>();
+                                            graphicData.put("name", "search_graphic");
+                                            graphicData.put("id", searchGraphic.getId());
+                                            
+                                            java.awt.Rectangle bounds = searchGraphic.getBounds();
+                                            if (bounds != null) {
+                                                graphicData.put("bounds", java.util.Map.of(
+                                                    "x", bounds.x, "y", bounds.y,
+                                                    "width", bounds.width, "height", bounds.height
+                                                ));
+                                                graphicData.put("visible", true);
+                                            } else {
+                                                graphicData.put("visible", false);
+                                            }
+                                            searchWidgets.add(graphicData);
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("search_widgets", searchWidgets);
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-bank-search-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_ge_widgets": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get the main GE widget (465.1) - GeOffers.CONTENTS
+                                        Widget mainGeWidget = client.getWidget(30474241); // 465.1
+                                        if (mainGeWidget == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "ge-not-open");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        java.util.List<java.util.Map<String,Object>> allWidgets = new java.util.ArrayList<>();
+                                        
+                                        // Use the existing collectChildWidgets method to get all children recursively
+                                        collectChildWidgets(mainGeWidget, allWidgets);
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("widgets", allWidgets);
+                                        resp.put("count", allWidgets.size());
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-ge-widgets-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_ge_offers": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get the main GE widget (465.1) - GeOffers.CONTENTS
+                                        Widget mainGeWidget = client.getWidget(30474241); // 465.1
+                                        if (mainGeWidget == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "ge-not-open");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        java.util.Map<String, java.util.List<java.util.Map<String,Object>>> indexOffers = new java.util.LinkedHashMap<>();
+                                        
+                                        // Define INDEX parent widget IDs and their ranges
+                                        int[] indexParentIds = {(465 << 16) | 7, (465 << 16) | 8, (465 << 16) | 9, (465 << 16) | 10, (465 << 16) | 11, (465 << 16) | 12, (465 << 16) | 13, (465 << 16) | 14};
+                                        String[] indexNames = {"INDEX_0", "INDEX_1", "INDEX_2", "INDEX_3", "INDEX_4", "INDEX_5", "INDEX_6", "INDEX_7"};
+                                        
+                                        // Initialize lists for each INDEX
+                                        for (int i = 0; i < indexParentIds.length; i++) {
+                                            indexOffers.put(indexNames[i], new java.util.ArrayList<>());
+                                        }
+                                        
+                                        // Process each INDEX parent widget
+                                        for (int i = 0; i < indexParentIds.length; i++) {
+                                            Widget indexWidget = client.getWidget(indexParentIds[i]);
+                                            if (indexWidget != null) {
+                                                // Collect all nested children under this INDEX widget
+                                                java.util.List<Widget> indexChildren = new java.util.ArrayList<>();
+                                                getAllNestedChildren(indexWidget, indexChildren);
+                                                
+                                                // Process each child widget
+                                                for (Widget child : indexChildren) {
+                                                    if (child != null) {
+                                                        // Check visibility: not hidden AND has valid bounds
+                                                        boolean visible = false;
+                                                        java.awt.Rectangle bounds = null;
+                                                        try {
+                                                            bounds = child.getBounds();
+                                                            boolean isHidden = child.isHidden();
+                                                            boolean hasValidBounds = (bounds != null && bounds.x >= 0 && bounds.y >= 0);
+                                                            visible = !isHidden && hasValidBounds;
+                                                        } catch (Exception ignored) {}
+                                                        
+                                                        // Only process visible widgets
+                                                        if (visible) {
+                                                            int widgetId = child.getId();
+                                                            
+                                                            java.util.Map<String,Object> offerData = new java.util.LinkedHashMap<>();
+                                                            offerData.put("id", widgetId);
+                                                            offerData.put("id_hex", String.format("0x%08X", widgetId));
+                                                            
+                                                            // Extract group, child, and grandchild from widget ID
+                                                            int group = (widgetId >> 16) & 0xFFFF;
+                                                            int childIndex = (widgetId >> 8) & 0xFF;
+                                                            int grandchildIndex = widgetId & 0xFF;
+                                                            
+                                                            offerData.put("group", group);
+                                                            offerData.put("child_index", childIndex);
+                                                            offerData.put("grandchild_index", grandchildIndex);
+                                                            
+                                                            // Get text safely
+                                                            try {
+                                                                String text = child.getText();
+                                                                offerData.put("text", text != null ? text : "");
+                                                            } catch (Exception ignored) {
+                                                                offerData.put("text", "");
+                                                            }
+                                                            
+                                                            // Get bounds safely (we already have bounds from visibility check)
+                                                            if (bounds != null) {
+                                                                offerData.put("bounds", java.util.Map.of(
+                                                                    "x", bounds.x, "y", bounds.y,
+                                                                    "width", bounds.width, "height", bounds.height
+                                                                ));
+                                                            }
+                                                            
+                                                            // Get additional widget properties
+                                                            try {
+                                                                offerData.put("hasListener", child.hasListener());
+                                                                offerData.put("spriteId", child.getSpriteId());
+                                                                offerData.put("itemId", child.getItemId());
+                                                                offerData.put("itemQuantity", child.getItemQuantity());
+                                                            } catch (Exception ignored) {}
+                                                            
+                                                            // Add to the appropriate INDEX list
+                                                            indexOffers.get(indexNames[i]).add(offerData);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("index_offers", indexOffers);
+                                        
+                                        // Also provide a flat list for backward compatibility
+                                        java.util.List<java.util.Map<String,Object>> allOffers = new java.util.ArrayList<>();
+                                        for (java.util.List<java.util.Map<String,Object>> offers : indexOffers.values()) {
+                                            allOffers.addAll(offers);
+                                        }
+                                        resp.put("offers", allOffers);
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-ge-offers-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(300, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_ge_setup": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get the main GE widget (465.1) - GeOffers.CONTENTS
+                                        Widget mainGeWidget = client.getWidget(30474241); // 465.1
+                                        if (mainGeWidget == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "ge-not-open");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        java.util.List<java.util.Map<String,Object>> setup = new java.util.ArrayList<>();
+                                        
+                                        // Get all child widgets and filter for setup widgets (465.26.*)
+                                        java.util.List<Widget> allChildren = new java.util.ArrayList<>();
+                                        getAllNestedChildren(mainGeWidget, allChildren);
+                                        
+                                        for (Widget child : allChildren) {
+                                            if (child != null) {
+                                                int widgetId = child.getId();
+                                                // Check for setup widgets (30474266-30474324 range for 465.26[0-58])
+                                                if (30474266 <= widgetId && widgetId <= 30474324) {
+                                                    java.util.Map<String,Object> setupData = new java.util.LinkedHashMap<>();
+                                                    setupData.put("id", widgetId);
+                                                    setupData.put("index", widgetId - 30474266); // Calculate index
+                                                    
+                                                    // Get text safely
+                                                    try {
+                                                        String text = child.getText();
+                                                        setupData.put("text", text != null ? text : "");
+                                                    } catch (Exception ignored) {
+                                                        setupData.put("text", "");
+                                                    }
+                                                    
+                                                    // Get bounds safely
+                                                    try {
+                                                        java.awt.Rectangle bounds = child.getBounds();
+                                                        if (bounds != null) {
+                                                            setupData.put("bounds", java.util.Map.of(
+                                                                "x", bounds.x, "y", bounds.y,
+                                                                "width", bounds.width, "height", bounds.height
+                                                            ));
+                                                        }
+                                                    } catch (Exception ignored) {}
+                                                    
+                                                    setup.add(setupData);
+                                                }
+                                            }
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("setup", setup);
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-ge-setup-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(300, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_ge_confirm": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get the main GE widget (465.1) - GeOffers.CONTENTS
+                                        Widget mainGeWidget = client.getWidget(30474241); // 465.1
+                                        if (mainGeWidget == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "ge-not-open");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        java.util.List<java.util.Map<String,Object>> confirm = new java.util.ArrayList<>();
+                                        
+                                        // Get all child widgets and filter for confirm widgets (465.30.*)
+                                        java.util.List<Widget> allChildren = new java.util.ArrayList<>();
+                                        getAllNestedChildren(mainGeWidget, allChildren);
+                                        
+                                        for (Widget child : allChildren) {
+                                            if (child != null) {
+                                                int widgetId = child.getId();
+                                                // Check for confirm widgets (30474270-30474278 range for 465.30[0-8])
+                                                if (30474270 <= widgetId && widgetId <= 30474278) {
+                                                    java.util.Map<String,Object> confirmData = new java.util.LinkedHashMap<>();
+                                                    confirmData.put("id", widgetId);
+                                                    confirmData.put("index", widgetId - 30474270); // Calculate index
+                                                    
+                                                    // Get text safely
+                                                    try {
+                                                        String text = child.getText();
+                                                        confirmData.put("text", text != null ? text : "");
+                                                    } catch (Exception ignored) {
+                                                        confirmData.put("text", "");
+                                                    }
+                                                    
+                                                    // Get bounds safely
+                                                    try {
+                                                        java.awt.Rectangle bounds = child.getBounds();
+                                                        if (bounds != null) {
+                                                            confirmData.put("bounds", java.util.Map.of(
+                                                                "x", bounds.x, "y", bounds.y,
+                                                                "width", bounds.width, "height", bounds.height
+                                                            ));
+                                                        }
+                                                    } catch (Exception ignored) {}
+                                                    
+                                                    confirm.add(confirmData);
+                                                }
+                                            }
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("confirm", confirm);
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-ge-confirm-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(300, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_ge_buttons": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        java.util.List<java.util.Map<String,Object>> buttons = new java.util.ArrayList<>();
+                                        
+                                        // Get main GE buttons
+                                        int[] buttonIds = {(465 << 16) | 4, (465 << 16) | 5, (465 << 16) | 6}; // BACK, INDEX, COLLECTALL
+                                        String[] buttonNames = {"back", "index", "collect_all"};
+                                        
+                                        for (int i = 0; i < buttonIds.length; i++) {
+                                            Widget buttonWidget = client.getWidget(buttonIds[i]);
+                                            if (buttonWidget != null) {
+                                                java.util.Map<String,Object> buttonData = new java.util.LinkedHashMap<>();
+                                                buttonData.put("name", buttonNames[i]);
+                                                buttonData.put("id", buttonWidget.getId());
+                                                
+                                                // Get text safely
+                                                try {
+                                                    String text = buttonWidget.getText();
+                                                    buttonData.put("text", text != null ? text : "");
+                                                } catch (Exception ignored) {
+                                                    buttonData.put("text", "");
+                                                }
+                                                
+                                                // Get bounds safely
+                                                try {
+                                                    java.awt.Rectangle bounds = buttonWidget.getBounds();
+                                                    if (bounds != null) {
+                                                        buttonData.put("bounds", java.util.Map.of(
+                                                            "x", bounds.x, "y", bounds.y,
+                                                            "width", bounds.width, "height", bounds.height
+                                                        ));
+                                                    }
+                                                } catch (Exception ignored) {}
+                                                
+                                                buttons.add(buttonData);
+                                            }
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("buttons", buttons);
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-ge-buttons-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+
+                            case "door_state": {
+                                Integer doorX = cmd.door_x;
+                                Integer doorY = cmd.door_y;
+                                Integer doorP = cmd.door_p;
+                                
+                                if (doorX == null || doorY == null || doorP == null) {
+                                    out.println("{\"ok\":false,\"err\":\"need door_x, door_y, door_p\"}");
+                                    break;
+                                }
+                                
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        final Scene scene = client.getScene();
+                                        if (scene == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "no-scene");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        final int baseX = client.getBaseX();
+                                        final int baseY = client.getBaseY();
+                                        final int lx = doorX - baseX;
+                                        final int ly = doorY - baseY;
+                                        
+                                        if (lx < 0 || lx >= 104 || ly < 0 || ly >= 104) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "tile-out-of-scene");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        final Tile[][][] tilesArr = scene.getTiles();
+                                        if (tilesArr == null || doorP < 0 || doorP >= tilesArr.length || tilesArr[doorP] == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "invalid-plane");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        final Tile tile = tilesArr[doorP][lx][ly];
+                                        final WallObject wobj = (tile != null) ? tile.getWallObject() : null;
+                                        
+                                        if (wobj == null) {
+                                            resp.put("ok", true);
+                                            resp.put("wall_object", null);
+                                        } else {
+                                            final ObjectComposition comp = client.getObjectDefinition(wobj.getId());
+                                            
+                                            java.util.Map<String,Object> wallObject = new java.util.LinkedHashMap<>();
+                                            wallObject.put("id", wobj.getId());
+                                            wallObject.put("orientationA", wobj.getOrientationA());
+                                            wallObject.put("orientationB", wobj.getOrientationB());
+                                            
+                                            if (comp != null) {
+                                                wallObject.put("name", comp.getName());
+                                            }
+                                            
+                                            // Get convex hull bounds
+                                            try {
+                                                final java.awt.Shape hull = wobj.getConvexHull();
+                                                if (hull != null) {
+                                                    final java.awt.Rectangle rb = hull.getBounds();
+                                                    if (rb != null) {
+                                                        wallObject.put("bounds", java.util.Map.of(
+                                                                "x", rb.x, "y", rb.y, "width", rb.width, "height", rb.height
+                                                        ));
+                                                    }
+                                                }
+                                            } catch (Exception ignored) {}
+                                            
+                                            resp.put("ok", true);
+                                            resp.put("wall_object", wallObject);
+                                        }
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "door-state-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_chat_widgets": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        resp.put("ok", true);
+                                        
+                                        // ChatLeft widgets (NPC dialogue)
+                                        java.util.Map<String,Object> chatLeft = new java.util.LinkedHashMap<>();
+                                        
+                                        // ChatLeft.NAME (15138820)
+                                        Widget wChatName = client.getWidget(15138820);
+                                        java.util.Map<String,Object> nameInfo = new java.util.LinkedHashMap<>();
+                                        nameInfo.put("id", 15138820);
+                                        nameInfo.put("exists", wChatName != null && !wChatName.isHidden());
+                                        if (wChatName != null && !wChatName.isHidden()) {
+                                            nameInfo.put("text", wChatName.getText());
+                                            java.awt.Rectangle bounds = wChatName.getBounds();
+                                            if (bounds != null) {
+                                                nameInfo.put("bounds", java.util.Map.of(
+                                                        "x", bounds.x,
+                                                        "y", bounds.y,
+                                                        "width", bounds.width,
+                                                        "height", bounds.height
+                                                ));
+                                            } else {
+                                                nameInfo.put("bounds", null);
+                                            }
+                                        } else {
+                                            nameInfo.put("text", null);
+                                            nameInfo.put("bounds", null);
+                                        }
+                                        chatLeft.put("name", nameInfo);
+                                        
+                                        // ChatLeft.CONTINUE (15138821)
+                                        Widget wChatContinue = client.getWidget(15138821);
+                                        java.util.Map<String,Object> continueInfo = new java.util.LinkedHashMap<>();
+                                        continueInfo.put("id", 15138821);
+                                        continueInfo.put("exists", wChatContinue != null && !wChatContinue.isHidden());
+                                        if (wChatContinue != null && !wChatContinue.isHidden()) {
+                                            java.awt.Rectangle bounds = wChatContinue.getBounds();
+                                            if (bounds != null) {
+                                                continueInfo.put("bounds", java.util.Map.of(
+                                                        "x", bounds.x,
+                                                        "y", bounds.y,
+                                                        "width", bounds.width,
+                                                        "height", bounds.height
+                                                ));
+                                                
+                                                // Calculate center point for easy clicking
+                                                java.util.Map<String,Object> center = new java.util.LinkedHashMap<>();
+                                                center.put("x", bounds.x + bounds.width / 2);
+                                                center.put("y", bounds.y + bounds.height / 2);
+                                                continueInfo.put("center", center);
+                                            } else {
+                                                continueInfo.put("bounds", null);
+                                                continueInfo.put("center", null);
+                                            }
+                                            continueInfo.put("hasListener", wChatContinue.hasListener());
+                                            continueInfo.put("text", wChatContinue.getText());
+                                            continueInfo.put("name", wChatContinue.getName());
+                                        } else {
+                                            continueInfo.put("bounds", null);
+                                            continueInfo.put("hasListener", false);
+                                            continueInfo.put("text", null);
+                                            continueInfo.put("name", null);
+                                            continueInfo.put("center", null);
+                                        }
+                                        chatLeft.put("continue", continueInfo);
+                                        
+                                        // ChatLeft.TEXT (15138822)
+                                        Widget wChatText = client.getWidget(15138822);
+                                        java.util.Map<String,Object> textInfo = new java.util.LinkedHashMap<>();
+                                        textInfo.put("id", 15138822);
+                                        textInfo.put("exists", wChatText != null && !wChatText.isHidden());
+                                        if (wChatText != null && !wChatText.isHidden()) {
+                                            textInfo.put("text", wChatText.getText());
+                                            java.awt.Rectangle bounds = wChatText.getBounds();
+                                            if (bounds != null) {
+                                                textInfo.put("bounds", java.util.Map.of(
+                                                        "x", bounds.x,
+                                                        "y", bounds.y,
+                                                        "width", bounds.width,
+                                                        "height", bounds.height
+                                                ));
+                                            } else {
+                                                textInfo.put("bounds", null);
+                                            }
+                                        } else {
+                                            textInfo.put("text", null);
+                                            textInfo.put("bounds", null);
+                                        }
+                                        chatLeft.put("text", textInfo);
+                                        
+                                        resp.put("chatLeft", chatLeft);
+                                        
+                                        // ChatMenu widgets (dialogue options)
+                                        java.util.Map<String,Object> chatMenu = new java.util.LinkedHashMap<>();
+                                        
+                                        // Chatmenu.OPTIONS (14352385)
+                                        Widget wOptions = client.getWidget(14352385);
+                                        java.util.Map<String,Object> optionsInfo = new java.util.LinkedHashMap<>();
+                                        optionsInfo.put("id", 14352385);
+                                        optionsInfo.put("exists", wOptions != null && !wOptions.isHidden());
+                                        
+                                        java.util.List<String> optionTexts = new java.util.ArrayList<>();
+                                        if (wOptions != null && !wOptions.isHidden() && wOptions.getChildren() != null) {
+                                            java.awt.Rectangle bounds = wOptions.getBounds();
+                                            if (bounds != null) {
+                                                optionsInfo.put("bounds", java.util.Map.of(
+                                                        "x", bounds.x,
+                                                        "y", bounds.y,
+                                                        "width", bounds.width,
+                                                        "height", bounds.height
+                                                ));
+                                            } else {
+                                                optionsInfo.put("bounds", null);
+                                            }
+                                            for (Widget child : wOptions.getChildren()) {
+                                                if (child != null && !child.isHidden()) {
+                                                    String text = child.getText();
+                                                    if (text != null && !text.trim().isEmpty()) {
+                                                        optionTexts.add(text);
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            optionsInfo.put("bounds", null);
+                                        }
+                                        optionsInfo.put("texts", optionTexts);
+                                        chatMenu.put("options", optionsInfo);
+                                        
+                                        resp.put("chatMenu", chatMenu);
+                                        
+                                        // ChatRight widgets (player dialogue)
+                                        java.util.Map<String,Object> chatRight = new java.util.LinkedHashMap<>();
+                                        
+                                        // Player Name (14221316)
+                                        Widget wPlayerName = client.getWidget(14221316);
+                                        java.util.Map<String,Object> playerNameInfo = new java.util.LinkedHashMap<>();
+                                        playerNameInfo.put("id", 14221316);
+                                        playerNameInfo.put("exists", wPlayerName != null && !wPlayerName.isHidden());
+                                        if (wPlayerName != null && !wPlayerName.isHidden()) {
+                                            playerNameInfo.put("text", wPlayerName.getText());
+                                            java.awt.Rectangle bounds = wPlayerName.getBounds();
+                                            if (bounds != null) {
+                                                playerNameInfo.put("bounds", java.util.Map.of(
+                                                        "x", bounds.x,
+                                                        "y", bounds.y,
+                                                        "width", bounds.width,
+                                                        "height", bounds.height
+                                                ));
+                                            } else {
+                                                playerNameInfo.put("bounds", null);
+                                            }
+                                        } else {
+                                            playerNameInfo.put("text", null);
+                                            playerNameInfo.put("bounds", null);
+                                        }
+                                        chatRight.put("name", playerNameInfo);
+                                        
+                                        // Player Continue (14221317)
+                                        Widget wPlayerContinue = client.getWidget(14221317);
+                                        java.util.Map<String,Object> playerContinueInfo = new java.util.LinkedHashMap<>();
+                                        playerContinueInfo.put("id", 14221317);
+                                        playerContinueInfo.put("exists", wPlayerContinue != null && !wPlayerContinue.isHidden());
+                                        if (wPlayerContinue != null && !wPlayerContinue.isHidden()) {
+                                            java.awt.Rectangle bounds = wPlayerContinue.getBounds();
+                                            if (bounds != null) {
+                                                playerContinueInfo.put("bounds", java.util.Map.of(
+                                                        "x", bounds.x,
+                                                        "y", bounds.y,
+                                                        "width", bounds.width,
+                                                        "height", bounds.height
+                                                ));
+                                                
+                                                // Calculate center point for easy clicking
+                                                java.util.Map<String,Object> center = new java.util.LinkedHashMap<>();
+                                                center.put("x", bounds.x + bounds.width / 2);
+                                                center.put("y", bounds.y + bounds.height / 2);
+                                                playerContinueInfo.put("center", center);
+                                            } else {
+                                                playerContinueInfo.put("bounds", null);
+                                                playerContinueInfo.put("center", null);
+                                            }
+                                            playerContinueInfo.put("hasListener", wPlayerContinue.hasListener());
+                                            playerContinueInfo.put("text", wPlayerContinue.getText());
+                                            playerContinueInfo.put("name", wPlayerContinue.getName());
+                                        } else {
+                                            playerContinueInfo.put("bounds", null);
+                                            playerContinueInfo.put("hasListener", false);
+                                            playerContinueInfo.put("text", null);
+                                            playerContinueInfo.put("name", null);
+                                            playerContinueInfo.put("center", null);
+                                        }
+                                        chatRight.put("continue", playerContinueInfo);
+                                        
+                                        // Player Text (14221318)
+                                        Widget wPlayerText = client.getWidget(14221318);
+                                        java.util.Map<String,Object> playerTextInfo = new java.util.LinkedHashMap<>();
+                                        playerTextInfo.put("id", 14221318);
+                                        playerTextInfo.put("exists", wPlayerText != null && !wPlayerText.isHidden());
+                                        if (wPlayerText != null && !wPlayerText.isHidden()) {
+                                            playerTextInfo.put("text", wPlayerText.getText());
+                                            java.awt.Rectangle bounds = wPlayerText.getBounds();
+                                            if (bounds != null) {
+                                                playerTextInfo.put("bounds", java.util.Map.of(
+                                                        "x", bounds.x,
+                                                        "y", bounds.y,
+                                                        "width", bounds.width,
+                                                        "height", bounds.height
+                                                ));
+                                            } else {
+                                                playerTextInfo.put("bounds", null);
+                                            }
+                                        } else {
+                                            playerTextInfo.put("text", null);
+                                            playerTextInfo.put("bounds", null);
+                                        }
+                                        chatRight.put("text", playerTextInfo);
+                                        
+                                        resp.put("chatRight", chatRight);
+                                        
+                                    } catch (Exception e) {
+                                        resp.put("ok", false);
+                                        resp.put("error", e.getMessage());
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_player": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        final Player localPlayer = client.getLocalPlayer();
+                                        if (localPlayer == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "no-local-player");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        final java.util.Map<String,Object> player = new java.util.LinkedHashMap<>();
+                                        
+                                        // Basic player info
+                                        player.put("name", localPlayer.getName());
+                                        player.put("combatLevel", localPlayer.getCombatLevel());
+                                        player.put("animation", localPlayer.getAnimation());
+                                        
+                                        // World location
+                                        final WorldPoint worldLocation = localPlayer.getWorldLocation();
+                                        if (worldLocation != null) {
+                                            player.put("worldX", worldLocation.getX());
+                                            player.put("worldY", worldLocation.getY());
+                                            player.put("plane", worldLocation.getPlane());
+                                        }
+                                        
+                                        // Canvas location
+                                        final LocalPoint localLocation = localPlayer.getLocalLocation();
+                                        if (localLocation != null) {
+                                            final net.runelite.api.Point canvasLocation = Perspective.localToCanvas(client, localLocation, localPlayer.getWorldLocation().getPlane());
+                                            if (canvasLocation != null) {
+                                                player.put("canvasX", canvasLocation.getX());
+                                                player.put("canvasY", canvasLocation.getY());
+                                            }
+                                        }
+                                        
+                                        // Health/status
+                                        player.put("healthRatio", localPlayer.getHealthRatio());
+                                        player.put("healthScale", localPlayer.getHealthScale());
+                                        
+                                        // Run energy
+                                        player.put("runEnergy", client.getEnergy());
+                                        
+                                        // Combat status
+                                        player.put("isInteracting", localPlayer.isInteracting());
+                                        player.put("combatLevel", localPlayer.getCombatLevel());
+                                        
+                                        // Get interacting target info
+                                        final Actor interacting = localPlayer.getInteracting();
+                                        if (interacting != null) {
+                                            final java.util.Map<String,Object> target = new java.util.LinkedHashMap<>();
+                                            target.put("name", interacting.getName());
+                                            
+                                            // Get ID based on actor type
+                                            if (interacting instanceof NPC) {
+                                                target.put("id", ((NPC) interacting).getId());
+                                                target.put("type", "NPC");
+                                            } else if (interacting instanceof Player) {
+                                                target.put("id", ((Player) interacting).getId());
+                                                target.put("type", "Player");
+                                            } else {
+                                                target.put("id", -1);
+                                                target.put("type", "Unknown");
+                                            }
+                                            
+                                            target.put("worldX", interacting.getWorldLocation().getX());
+                                            target.put("worldY", interacting.getWorldLocation().getY());
+                                            target.put("worldP", interacting.getWorldLocation().getPlane());
+                                            target.put("healthRatio", interacting.getHealthRatio());
+                                            target.put("healthScale", interacting.getHealthScale());
+                                            target.put("combatLevel", interacting.getCombatLevel());
+                                            player.put("interactingTarget", target);
+                                        } else {
+                                            player.put("interactingTarget", null);
+                                        }
+                                        
+                                        // Skills
+                                        final java.util.Map<String,Object> skills = new java.util.LinkedHashMap<>();
+                                        try {
+                                            // Get all skill levels and XP
+                                            for (final Skill skill : Skill.values()) {
+                                                if (skill != Skill.OVERALL) { // Skip overall skill
+                                                    final java.util.Map<String,Object> skillData = new java.util.LinkedHashMap<>();
+                                                    skillData.put("level", client.getRealSkillLevel(skill));
+                                                    skillData.put("boostedLevel", client.getBoostedSkillLevel(skill));
+                                                    skillData.put("xp", client.getSkillExperience(skill));
+                                                    skills.put(skill.getName().toLowerCase(), skillData);
+                                                }
+                                            }
+                                        } catch (Exception e) {
+                                            // If skill data fails, continue without it
+                                        }
+                                        player.put("skills", skills);
+                                        
+                                        // Game objects on player's tile
+                                        final java.util.List<java.util.Map<String,Object>> tileObjects = new java.util.ArrayList<>();
+                                        if (worldLocation != null) {
+                                            final Scene scene = client.getScene();
+                                            if (scene != null) {
+                                                final int baseX = client.getBaseX();
+                                                final int baseY = client.getBaseY();
+                                                final int localX = worldLocation.getX() - baseX;
+                                                final int localY = worldLocation.getY() - baseY;
+                                                
+                                                if (localX >= 0 && localX < 104 && localY >= 0 && localY < 104) {
+                                                    final Tile tile = scene.getTiles()[worldLocation.getPlane()][localX][localY];
+                                                    if (tile != null) {
+                                                        // Ground object
+                                                        final GroundObject groundObject = tile.getGroundObject();
+                                                        if (groundObject != null) {
+                                                            final java.util.Map<String,Object> obj = new java.util.LinkedHashMap<>();
+                                                            obj.put("type", "GROUND");
+                                                            obj.put("id", groundObject.getId());
+                                                            final ObjectComposition comp = client.getObjectDefinition(groundObject.getId());
+                                                            if (comp != null) {
+                                                                obj.put("name", comp.getName());
+                                                                obj.put("actions", comp.getActions());
+                                                            }
+                                                            tileObjects.add(obj);
+                                                        }
+                                                        
+                                                        // Wall objects
+                                                        final WallObject wallObject = tile.getWallObject();
+                                                        if (wallObject != null) {
+                                                            final java.util.Map<String,Object> obj = new java.util.LinkedHashMap<>();
+                                                            obj.put("type", "WALL");
+                                                            obj.put("id", wallObject.getId());
+                                                            final ObjectComposition comp = client.getObjectDefinition(wallObject.getId());
+                                                            if (comp != null) {
+                                                                obj.put("name", comp.getName());
+                                                                obj.put("actions", comp.getActions());
+                                                            }
+                                                            tileObjects.add(obj);
+                                                        }
+                                                        
+                                                        // Decorative objects
+                                                        final DecorativeObject decorativeObject = tile.getDecorativeObject();
+                                                        if (decorativeObject != null) {
+                                                            final java.util.Map<String,Object> obj = new java.util.LinkedHashMap<>();
+                                                            obj.put("type", "DECORATIVE");
+                                                            obj.put("id", decorativeObject.getId());
+                                                            final ObjectComposition comp = client.getObjectDefinition(decorativeObject.getId());
+                                                            if (comp != null) {
+                                                                obj.put("name", comp.getName());
+                                                                obj.put("actions", comp.getActions());
+                                                            }
+                                                            tileObjects.add(obj);
+                                                        }
+                                                        
+                                                        // Game objects (multiple per tile)
+                                                        final GameObject[] gameObjects = tile.getGameObjects();
+                                                        if (gameObjects != null) {
+                                                            for (final GameObject gameObject : gameObjects) {
+                                                                if (gameObject != null) {
+                                                                    final java.util.Map<String,Object> obj = new java.util.LinkedHashMap<>();
+                                                                    obj.put("type", "GAME_OBJECT");
+                                                                    obj.put("id", gameObject.getId());
+                                                                    final ObjectComposition comp = client.getObjectDefinition(gameObject.getId());
+                                                                    if (comp != null) {
+                                                                        obj.put("name", comp.getName());
+                                                                        obj.put("actions", comp.getActions());
+                                                                    }
+                                                                    tileObjects.add(obj);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        player.put("tileObjects", tileObjects);
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("player", player);
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-player-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_equipment": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        final ItemContainer equipment = client.getItemContainer(InventoryID.EQUIPMENT);
+                                        if (equipment == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "no-equipment-container");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        final Item[] items = equipment.getItems();
+                                        if (items == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "no-equipment-items");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        final java.util.Map<String,Object> equipmentData = new java.util.LinkedHashMap<>();
+                                        final java.util.List<java.util.Map<String,Object>> slots = new java.util.ArrayList<>();
+                                        
+                                        // Process each equipment slot
+                                        for (final EquipmentInventorySlot slot : EquipmentInventorySlot.values()) {
+                                            final int slotIdx = slot.getSlotIdx();
+                                            if (slotIdx < items.length) {
+                                                final Item item = items[slotIdx];
+                                                final java.util.Map<String,Object> slotData = new java.util.LinkedHashMap<>();
+                                                
+                                                slotData.put("slot", slot.name());
+                                                slotData.put("slotIndex", slotIdx);
+                                                
+                                                if (item != null && item.getId() != -1) {
+                                                    final ItemComposition comp = client.getItemDefinition(item.getId());
+                                                    slotData.put("id", item.getId());
+                                                    slotData.put("quantity", item.getQuantity());
+                                                    slotData.put("name", comp != null ? comp.getName() : "Unknown");
+                                                    
+                                                    if (comp != null) {
+                                                        slotData.put("actions", comp.getInventoryActions());
+                                                        slotData.put("members", comp.isMembers());
+                                                        slotData.put("stackable", comp.isStackable());
+                                                    }
+                                                    
+                                                    equipmentData.put(slot.name().toLowerCase(), slotData);
+                                                } else {
+                                                    slotData.put("id", -1);
+                                                    slotData.put("quantity", 0);
+                                                    slotData.put("name", "");
+                                                    slotData.put("actions", new String[0]);
+                                                    slotData.put("members", false);
+                                                    slotData.put("stackable", false);
+                                                    
+                                                    equipmentData.put(slot.name().toLowerCase(), slotData);
+                                                }
+                                                
+                                                slots.add(slotData);
+                                            }
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("equipment", equipmentData);
+                                        resp.put("slots", slots);
+                                        resp.put("totalSlots", EquipmentInventorySlot.values().length);
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-equipment-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_equipment_inventory": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get the EquipmentSide.ITEMS widget (ID 5570560)
+                                        Widget equipmentItemsWidget = client.getWidget(5570560);
+                                        if (equipmentItemsWidget == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "equipment-inventory-not-found");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        // Check if the equipment interface is open
+                                        boolean isHidden = equipmentItemsWidget.isHidden();
+                                        if (isHidden) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "equipment-interface-closed");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        // Use the existing collectChildWidgets method to get all children recursively
+                                        java.util.List<java.util.Map<String,Object>> allChildren = new java.util.ArrayList<>();
+                                        collectChildWidgets(equipmentItemsWidget, allChildren);
+                                        
+                                        // Filter for equipment inventory items and process them
+                                        java.util.List<java.util.Map<String,Object>> items = new java.util.ArrayList<>();
+                                        int slotIndex = 0;
+                                        
+                                        for (java.util.Map<String,Object> childData : allChildren) {
+                                            // Check if this is an equipment inventory item using name field
+                                            String name = (String) childData.get("name");
+                                            
+                                            // Only include items that have names
+                                            if (name != null && !name.isEmpty()) {
+                                                // Remove color codes like <col=ff9040> and </col>
+                                                String itemName = name.replaceAll("<col=[^>]*>", "").replaceAll("</col>", "");
+                                                
+                                                // Only include items that have actual names (not empty after color code removal)
+                                                if (!itemName.isEmpty()) {
+                                                    java.util.Map<String,Object> itemData = new java.util.LinkedHashMap<>();
+                                                    
+                                                    itemData.put("slot", slotIndex++);
+                                                    itemData.put("name", itemName);
+                                                    itemData.put("rawName", name); // Keep original name with color codes
+                                                    itemData.put("widgetId", childData.get("id")); // Include widget ID
+                                                    
+                                                    // Copy over bounds and visibility data from childData
+                                                    itemData.put("visible", childData.get("visible"));
+                                                    itemData.put("hasListener", childData.get("hasListener"));
+                                                    itemData.put("isIf3", childData.get("isIf3"));
+                                                    
+                                                    // Get bounds for clicking
+                                                    @SuppressWarnings("unchecked")
+                                                    java.util.Map<String,Object> bounds = (java.util.Map<String,Object>) childData.get("bounds");
+                                                    if (bounds != null) {
+                                                        itemData.put("bounds", bounds);
+                                                        itemData.put("canvas", java.util.Map.of(
+                                                                "x", ((Number)bounds.get("x")).intValue() + ((Number)bounds.get("width")).intValue()/2,
+                                                                "y", ((Number)bounds.get("y")).intValue() + ((Number)bounds.get("height")).intValue()/2
+                                                        ));
+                                                    }
+                                                    
+                                                    // Check if this slot has an item (non-empty name)
+                                                    itemData.put("hasItem", true);
+                                                    
+                                                    items.add(itemData);
+                                                }
+                                            }
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("items", items);
+                                        resp.put("count", items.size());
+                                        resp.put("interfaceOpen", !isHidden);
+                                        resp.put("totalChildrenFound", allChildren.size());
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-equipment-inventory-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_inventory": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        final ItemContainer inventory = client.getItemContainer(InventoryID.INVENTORY);
+                                        if (inventory == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "no-inventory-container");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        final Item[] items = inventory.getItems();
+                                        if (items == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "no-inventory-items");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        final java.util.List<java.util.Map<String,Object>> slots = new java.util.ArrayList<>();
+                                        
+                                        // Process each inventory slot (0-27)
+                                        for (int i = 0; i < 28; i++) {
+                                            final java.util.Map<String,Object> slotData = new java.util.LinkedHashMap<>();
+                                            
+                                            slotData.put("slot", i);
+                                            
+                                            if (i < items.length) {
+                                                final Item item = items[i];
+                                                
+                                                if (item != null && item.getId() != -1) {
+                                                    final ItemComposition comp = client.getItemDefinition(item.getId());
+                                                    slotData.put("id", item.getId());
+                                                    slotData.put("quantity", item.getQuantity());
+                                                    slotData.put("itemName", comp != null ? comp.getName() : "Unknown");
+                                                    
+                                                    if (comp != null) {
+                                                        slotData.put("actions", comp.getInventoryActions());
+                                                        slotData.put("members", comp.isMembers());
+                                                        slotData.put("stackable", comp.isStackable());
+                                                        slotData.put("noted", comp.getNote() == 799);
+                                                    }
+                                                    
+                                                    // Get inventory widget bounds for this slot
+                                                    try {
+                                                        final Widget inventoryWidget = client.getWidget(WidgetInfo.INVENTORY);
+                                                        if (inventoryWidget != null && !inventoryWidget.isHidden()) {
+                                                            final Widget[] children = inventoryWidget.getChildren();
+                                                            if (children != null && i < children.length) {
+                                                                final Widget slotWidget = children[i];
+                                                                if (slotWidget != null && !slotWidget.isHidden()) {
+                                                                    final Rectangle bounds = slotWidget.getBounds();
+                                                                    if (bounds != null) {
+                                                                        final java.util.Map<String,Object> boundsData = new java.util.LinkedHashMap<>();
+                                                                        boundsData.put("x", bounds.x);
+                                                                        boundsData.put("y", bounds.y);
+                                                                        boundsData.put("width", bounds.width);
+                                                                        boundsData.put("height", bounds.height);
+                                                                        slotData.put("bounds", boundsData);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    } catch (Exception e) {
+                                                        // Bounds not available, continue without them
+                                                    }
+                                                } else {
+                                                    slotData.put("id", -1);
+                                                    slotData.put("quantity", 0);
+                                                    slotData.put("itemName", "");
+                                                    slotData.put("actions", new String[0]);
+                                                    slotData.put("members", false);
+                                                    slotData.put("stackable", false);
+                                                    slotData.put("noted", false);
+                                                    
+                                                    // Get empty slot bounds
+                                                    try {
+                                                        final Widget inventoryWidget = client.getWidget(WidgetInfo.INVENTORY);
+                                                        if (inventoryWidget != null && !inventoryWidget.isHidden()) {
+                                                            final Widget[] children = inventoryWidget.getChildren();
+                                                            if (children != null && i < children.length) {
+                                                                final Widget slotWidget = children[i];
+                                                                if (slotWidget != null && !slotWidget.isHidden()) {
+                                                                    final Rectangle bounds = slotWidget.getBounds();
+                                                                    if (bounds != null) {
+                                                                        final java.util.Map<String,Object> boundsData = new java.util.LinkedHashMap<>();
+                                                                        boundsData.put("x", bounds.x);
+                                                                        boundsData.put("y", bounds.y);
+                                                                        boundsData.put("width", bounds.width);
+                                                                        boundsData.put("height", bounds.height);
+                                                                        slotData.put("bounds", boundsData);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    } catch (Exception e) {
+                                                        // Bounds not available, continue without them
+                                                    }
+                                                }
+                                            } else {
+                                                slotData.put("id", -1);
+                                                slotData.put("quantity", 0);
+                                                slotData.put("itemName", "");
+                                                slotData.put("actions", new String[0]);
+                                                slotData.put("members", false);
+                                                slotData.put("stackable", false);
+                                                slotData.put("noted", false);
+                                                
+                                                // Get empty slot bounds
+                                                try {
+                                                    final Widget inventoryWidget = client.getWidget(WidgetInfo.INVENTORY);
+                                                    if (inventoryWidget != null && !inventoryWidget.isHidden()) {
+                                                        final Widget[] children = inventoryWidget.getChildren();
+                                                        if (children != null && i < children.length) {
+                                                            final Widget slotWidget = children[i];
+                                                            if (slotWidget != null && !slotWidget.isHidden()) {
+                                                                final Rectangle bounds = slotWidget.getBounds();
+                                                                if (bounds != null) {
+                                                                    final java.util.Map<String,Object> boundsData = new java.util.LinkedHashMap<>();
+                                                                    boundsData.put("x", bounds.x);
+                                                                    boundsData.put("y", bounds.y);
+                                                                    boundsData.put("width", bounds.width);
+                                                                    boundsData.put("height", bounds.height);
+                                                                    slotData.put("bounds", boundsData);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                } catch (Exception e) {
+                                                    // Bounds not available, continue without them
+                                                }
+                                            }
+                                            
+                                            slots.add(slotData);
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("inventory", java.util.Map.of("slots", slots));
+                                        resp.put("slots", slots);
+                                        resp.put("totalSlots", 28);
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-inventory-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_bank_inventory": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get the Bankside.ITEMS widget (ID 983043)
+                                        Widget bankItemsWidget = client.getWidget(983043);
+                                        if (bankItemsWidget == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "bank-inventory-not-found");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        // Check if the bank interface is open
+                                        boolean isHidden = bankItemsWidget.isHidden();
+                                        if (isHidden) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "bank-interface-closed");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        // Use the existing collectChildWidgets method to get all children recursively
+                                        java.util.List<java.util.Map<String,Object>> allChildren = new java.util.ArrayList<>();
+                                        collectChildWidgets(bankItemsWidget, allChildren);
+                                        
+                                        // Filter for bank inventory items and process them
+                                        java.util.List<java.util.Map<String,Object>> items = new java.util.ArrayList<>();
+                                        int slotIndex = 0;
+                                        
+                                        for (java.util.Map<String,Object> childData : allChildren) {
+                                            // Check if this is a bank inventory item using name field
+                                            String name = (String) childData.get("name");
+                                            
+                                            // Only include items that have names
+                                            if (name != null && !name.isEmpty()) {
+                                                // Remove color codes like <col=ff9040> and </col>
+                                                String itemName = name.replaceAll("<col=[^>]*>", "").replaceAll("</col>", "");
+                                                
+                                                // Only include items that have actual names (not empty after color code removal)
+                                                if (!itemName.isEmpty()) {
+                                                    java.util.Map<String,Object> itemData = new java.util.LinkedHashMap<>();
+                                                    
+                                                    itemData.put("slot", slotIndex++);
+                                                    itemData.put("name", itemName);
+                                                    itemData.put("rawName", name); // Keep original name with color codes
+                                                    itemData.put("widgetId", childData.get("id")); // Include widget ID
+                                                    
+                                                    // Copy over bounds and visibility data from childData
+                                                    itemData.put("visible", childData.get("visible"));
+                                                    itemData.put("hasListener", childData.get("hasListener"));
+                                                    itemData.put("isIf3", childData.get("isIf3"));
+                                                    
+                                                    // Get bounds for clicking
+                                                    @SuppressWarnings("unchecked")
+                                                    java.util.Map<String,Object> bounds = (java.util.Map<String,Object>) childData.get("bounds");
+                                                    if (bounds != null) {
+                                                        itemData.put("bounds", bounds);
+                                                        itemData.put("canvas", java.util.Map.of(
+                                                                "x", ((Number)bounds.get("x")).intValue() + ((Number)bounds.get("width")).intValue()/2,
+                                                                "y", ((Number)bounds.get("y")).intValue() + ((Number)bounds.get("height")).intValue()/2
+                                                        ));
+                                                    }
+                                                    
+                                                    // Check if this slot has an item (non-empty name)
+                                                    itemData.put("hasItem", true);
+                                                    
+                                                    items.add(itemData);
+                                                }
+                                            }
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("items", items);
+                                        resp.put("count", items.size());
+                                        resp.put("interfaceOpen", !isHidden);
+                                        resp.put("totalChildrenFound", allChildren.size());
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-bank-inventory-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_bank": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get the actual bank contents using RuneLite's bank container
+                                        final ItemContainer bankContainer = client.getItemContainer(InventoryID.BANK);
+                                        if (bankContainer == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "no-bank-container");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        final Item[] bankItems = bankContainer.getItems();
+                                        if (bankItems == null) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "no-bank-items");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        final java.util.List<java.util.Map<String,Object>> items = new java.util.ArrayList<>();
+                                        
+                                        // Process each bank slot
+                                        for (int i = 0; i < bankItems.length; i++) {
+                                            final Item item = bankItems[i];
+                                            final java.util.Map<String,Object> itemData = new java.util.LinkedHashMap<>();
+                                            
+                                            itemData.put("slot", i);
+                                            
+                                            // Get widget bounds for this bank slot
+                                            final Widget bankItemsContainer = client.getWidget(786445); // 12.13
+                                            final java.util.Map<String,Object> bounds = new java.util.LinkedHashMap<>();
+                                            
+                                            if (bankItemsContainer != null) {
+                                                final Widget[] children = bankItemsContainer.getChildren();
+                                                if (children != null && i < children.length && children[i] != null) {
+                                                    final Widget slotWidget = children[i];
+                                                    bounds.put("x", slotWidget.getCanvasLocation().getX());
+                                                    bounds.put("y", slotWidget.getCanvasLocation().getY());
+                                                    bounds.put("width", slotWidget.getWidth());
+                                                    bounds.put("height", slotWidget.getHeight());
+                                                    bounds.put("visible", !slotWidget.isHidden());
+                                                } else {
+                                                    bounds.put("x", 0);
+                                                    bounds.put("y", 0);
+                                                    bounds.put("width", 0);
+                                                    bounds.put("height", 0);
+                                                    bounds.put("visible", false);
+                                                }
+                                            } else {
+                                                bounds.put("x", 0);
+                                                bounds.put("y", 0);
+                                                bounds.put("width", 0);
+                                                bounds.put("height", 0);
+                                                bounds.put("visible", false);
+                                            }
+                                            
+                                            itemData.put("bounds", bounds);
+                                            
+                                            if (item != null && item.getId() != -1) {
+                                                final ItemComposition comp = client.getItemDefinition(item.getId());
+                                                itemData.put("id", item.getId());
+                                                itemData.put("quantity", item.getQuantity());
+                                                itemData.put("name", comp != null ? comp.getName() : "Unknown");
+                                                
+                                                if (comp != null) {
+                                                    itemData.put("actions", comp.getInventoryActions());
+                                                    itemData.put("members", comp.isMembers());
+                                                    itemData.put("stackable", comp.isStackable());
+                                                }
+                                            } else {
+                                                itemData.put("id", -1);
+                                                itemData.put("quantity", 0);
+                                                itemData.put("name", "");
+                                                itemData.put("actions", new String[0]);
+                                                itemData.put("members", false);
+                                                itemData.put("stackable", false);
+                                            }
+                                            
+                                            items.add(itemData);
+                                        }
+                                        
+                                        // Get bank interface bounds
+                                        final Widget bankMain = client.getWidget(786433);
+                                        final java.util.Map<String,Object> bounds = new java.util.LinkedHashMap<>();
+                                        
+                                        if (bankMain != null) {
+                                            bounds.put("x", bankMain.getCanvasLocation().getX());
+                                            bounds.put("y", bankMain.getCanvasLocation().getY());
+                                            bounds.put("width", bankMain.getWidth());
+                                            bounds.put("height", bankMain.getHeight());
+                                            bounds.put("visible", !bankMain.isHidden());
+                                        } else {
+                                            bounds.put("x", 0);
+                                            bounds.put("y", 0);
+                                            bounds.put("width", 0);
+                                            bounds.put("height", 0);
+                                            bounds.put("visible", false);
+                                        }
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("items", items);
+                                        resp.put("count", items.size());
+                                        resp.put("totalSlots", bankItems.length);
+                                        resp.put("bounds", bounds);
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-bank-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "bank-xvalue": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Check if client is in the right state
+                                        if (client.getGameState() != GameState.LOGGED_IN) {
+                                            resp.put("ok", false);
+                                            resp.put("err", "not-logged-in");
+                                            fut.complete(resp);
+                                            return;
+                                        }
+                                        
+                                        final int mode = client.getVarbitValue(Varbits.BANK_QUANTITY_TYPE);
+                                        final int xVal = client.getVarbitValue(Varbits.BANK_REQUESTEDQUANTITY);
+                                        resp.put("ok", true);
+                                        resp.put("mode", mode);
+                                        resp.put("x", xVal);
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "bank-xvalue-failed");
+                                        resp.put("exception", t.getMessage());
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_quests": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        resp.put("ok", true);
+                                        
+                                        // Get quest states for all quests
+                                        java.util.Map<String, Object> quests = new java.util.LinkedHashMap<>();
+                                        for (net.runelite.api.Quest q : net.runelite.api.Quest.values()) {
+                                            net.runelite.api.QuestState st = q.getState(client);
+                                            quests.put(q.getName(), (st != null ? st.name() : null)); // e.g., NOT_STARTED / IN_PROGRESS / FINISHED
+                                        }
+                                        resp.put("quests", quests);
+                                        
+                                    } catch (Exception e) {
+                                        resp.put("ok", false);
+                                        resp.put("error", e.getMessage());
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_varc_int": {
+                                Integer varId = cmd.var_id;
+                                if (varId == null) {
+                                    out.println("{\"ok\":false,\"err\":\"need var_id\"}");
+                                    break;
+                                }
+                                
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        int value = client.getVarcIntValue(varId);
+                                        resp.put("ok", true);
+                                        resp.put("value", value);
+                                        resp.put("var_id", varId);
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-varc-int-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_varp": {
+                                Integer varpId = cmd.id;
+                                if (varpId == null) {
+                                    out.println("{\"ok\":false,\"err\":\"need id\"}");
+                                    break;
+                                }
+                                
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        int value = client.getVarpValue(varpId);
+                                        resp.put("ok", true);
+                                        resp.put("value", value);
+                                        resp.put("varp_id", varpId);
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-varp-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_spellbook": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get the MagicSpellbook.SPELLLAYER widget (ID 14286851)
+                                        Widget spellLayer = client.getWidget(14286851);
+                                        if (spellLayer != null) {
+                                            java.util.List<java.util.Map<String,Object>> spells = new java.util.ArrayList<>();
+                                            
+                                            // Get all child widgets
+                                            Widget[] children = spellLayer.getStaticChildren();
+                                            if (children != null) {
+                                                for (Widget child : children) {
+                                                    if (child != null) {
+                                                        java.util.Map<String,Object> spellData = new java.util.LinkedHashMap<>();
+                                                        spellData.put("id", child.getId());
+                                                        spellData.put("name", child.getName());
+                                                        
+                                                        // Get bounds if available
+                                                        java.awt.Rectangle bounds = child.getBounds();
+                                                        if (bounds != null) {
+                                                            spellData.put("bounds", java.util.Map.of(
+                                                                    "x", bounds.x,
+                                                                    "y", bounds.y,
+                                                                    "width", bounds.width,
+                                                                    "height", bounds.height
+                                                            ));
+                                                            spellData.put("canvas", java.util.Map.of(
+                                                                    "x", bounds.x + bounds.width/2,
+                                                                    "y", bounds.y + bounds.height/2
+                                                            ));
+                                                        }
+                                                        
+                                                        // Check if widget is visible and clickable
+                                                        spellData.put("visible", bounds != null && bounds.x >= 0 && bounds.y >= 0);
+                                                        spellData.put("hasListener", child.hasListener());
+                                                        
+                                                        spells.add(spellData);
+                                                    }
+                                                }
+                                            }
+                                            
+                                            resp.put("ok", true);
+                                            resp.put("spells", spells);
+                                            resp.put("count", spells.size());
+                                        } else {
+                                            resp.put("ok", false);
+                                            resp.put("err", "spellbook-not-found");
+                                        }
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-spellbook-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_camera": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get camera scale (zoom level) - this is the key method we need
+                                        int cameraScale = client.getScale();
+                                        
+                                        // Get camera pitch (vertical angle)
+                                        int cameraPitch = client.getCameraPitch();
+                                        
+                                        // Get camera yaw (horizontal angle)
+                                        int cameraYaw = client.getCameraYaw();
+                                        
+                                        // Get camera position coordinates
+                                        int cameraX = client.getCameraX();
+                                        int cameraY = client.getCameraY();
+                                        int cameraZ = client.getCameraZ();
+                                        
+                                        resp.put("ok", true);
+                                        resp.put("scale", cameraScale);
+                                        resp.put("pitch", cameraPitch);
+                                        resp.put("yaw", cameraYaw);
+                                        
+                                        // Camera position as coordinates
+                                        resp.put("position", java.util.Map.of(
+                                                "x", cameraX,
+                                                "y", cameraY,
+                                                "z", cameraZ
+                                        ));
+                                        
+                                        // Additional camera info
+                                        resp.put("plane", client.getPlane());
+                                        resp.put("baseX", client.getBaseX());
+                                        resp.put("baseY", client.getBaseY());
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-camera-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "ground_items": {
+                                final String needle = (cmd.name == null ? "" : cmd.name.trim().toLowerCase());
+                                final int radius = (cmd.radius == null) ? 10 : Math.max(1, cmd.radius);
+
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        final Player me = client.getLocalPlayer();
+                                        final Scene scene = client.getScene();
+                                        if (me == null || scene == null) { 
+                                            resp.put("ok", false); resp.put("err", "no-player-or-scene"); 
+                                            fut.complete(resp); return; 
+                                        }
+
+                                        final int plane = client.getPlane();
+                                        final int baseX = client.getBaseX(), baseY = client.getBaseY();
+                                        final int myWx = me.getWorldLocation().getX();
+                                        final int myWy = me.getWorldLocation().getY();
+                                        final int minWx = myWx - radius, maxWx = myWx + radius;
+                                        final int minWy = myWy - radius, maxWy = myWy + radius;
+
+                                        // Get all ground items from the scene
+                                        final Tile[][][] tiles = scene.getTiles();
+                                        if (tiles == null || plane < 0 || plane >= tiles.length || tiles[plane] == null) {
+                                            resp.put("ok", true); resp.put("items", new java.util.ArrayList<>());
+                                            fut.complete(resp); return; 
+                                        }
+
+                                        // Collect all matching ground items and find the closest one
+                                        java.util.List<java.util.Map<String,Object>> items = new java.util.ArrayList<>();
+                                        
+                                        // Search through all tiles in the scene for ground items
+                                        for (int lx = 0; lx < 104; lx++) {
+                                            final Tile[] col = tiles[plane][lx];
+                                            if (col == null) continue;
+                                            for (int ly = 0; ly < 104; ly++) {
+                                                final Tile tile = col[ly];
+                                                if (tile == null) continue;
+
+                                                final int wx = baseX + lx;
+                                                final int wy = baseY + ly;
+                                                
+                                                // Check if within radius
+                                                if (wx < minWx || wx > maxWx || wy < minWy || wy > maxWy) continue;
+
+                                                // Check for ground items using getGroundItems()
+                                                java.util.List<?> tileGroundItems = tile.getGroundItems();
+                                                if (tileGroundItems != null && !tileGroundItems.isEmpty()) {
+                                                    for (Object groundItem : tileGroundItems) {
+                                                        try {
+                                                            // Get item ID using reflection
+                                                            java.lang.reflect.Method getIdMethod = groundItem.getClass().getMethod("getId");
+                                                            int itemId = (Integer) getIdMethod.invoke(groundItem);
+                                                            
+                                                            // Get item name using client.getItemDefinition()
+                                                            ItemComposition comp = client.getItemDefinition(itemId);
+                                                            String itemName = comp != null ? comp.getName() : "Unknown";
+                                                            String itemNameLower = itemName.toLowerCase();
+                                                            
+                                                            // Only include items that match our search term
+                                                            if (!needle.isEmpty() && !itemNameLower.contains(needle)) continue;
+                                                            
+                                                            // Get screen coordinates
+                                                            net.runelite.api.coords.LocalPoint localPoint = tile.getLocalLocation();
+                                                            net.runelite.api.Point screenPoint = null;
+                                                            if (localPoint != null) {
+                                                                screenPoint = net.runelite.api.Perspective.localToCanvas(client, localPoint, plane);
+                                                            }
+                                                            
+                                                            // Build ground item data
+                                                            final java.util.Map<String,Object> itemData = new java.util.LinkedHashMap<>();
+                                                            itemData.put("type", "GROUND_ITEM");
+                                                            itemData.put("id", itemId);
+                                                            itemData.put("name", itemName);
+                                                            itemData.put("quantity", 1); // Ground items typically have quantity 1
+                                                            
+                                                            // Get ground item actions (not inventory actions)
+                                                            String[] groundActions = null;
+                                                            if (comp != null) {
+                                                                // Try to get ground item actions using reflection
+                                                                try {
+                                                                    java.lang.reflect.Method getGroundActionsMethod = comp.getClass().getMethod("getGroundActions");
+                                                                    groundActions = (String[]) getGroundActionsMethod.invoke(comp);
+                                                                } catch (Exception e) {
+                                                                    // Fallback to inventory actions if ground actions not available
+                                                                    groundActions = comp.getInventoryActions();
+                                                                }
+                                                            }
+                                                            itemData.put("actions", groundActions);
+                                                            itemData.put("world", java.util.Map.of("x", wx, "y", wy, "p", plane));
+                                                            itemData.put("distance", Math.abs(wx - myWx) + Math.abs(wy - myWy));
+                                                            
+                                                            // Add screen coordinates
+                                                            if (screenPoint != null) {
+                                                                itemData.put("canvas", java.util.Map.of("x", screenPoint.getX(), "y", screenPoint.getY()));
+                                                                itemData.put("bounds", java.util.Map.of(
+                                                                        "x", screenPoint.getX() - 8, "y", screenPoint.getY() - 8, "width", 16, "height", 16));
+                                                                itemData.put("clickbox", java.util.Map.of(
+                                                                        "x", screenPoint.getX() - 8, "y", screenPoint.getY() - 8, "width", 16, "height", 16));
+                                                            }
+                                                            
+                                                            items.add(itemData);
+                                                        } catch (Exception e) {
+                                                            // Skip items that can't be processed
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        resp.put("ok", true);
+                                        resp.put("items", items);
+                                        resp.put("count", items.size());
+
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false); resp.put("err", "ground-items-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_tutorial": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    try {
+                                        java.util.Map<String, Object> tutorial = new java.util.HashMap<>();
+                                        
+                                        // Main tutorial interface widget: TutorialDisplayname.MAIN (558.2)
+                                        Widget mainWidget = client.getWidget(558, 2);
+                                        boolean tutorialOpen = (mainWidget != null && !mainWidget.isHidden());
+                                        tutorial.put("open", tutorialOpen);
+                                        
+                                        if (tutorialOpen) {
+                                            tutorial.put("interface", "character_creation");
+                                            
+                                            // Main widget bounds
+                                            java.util.Map<String, Object> mainInfo = new java.util.HashMap<>();
+                                            mainInfo.put("id", 36569090); // TutorialDisplayname.MAIN
+                                            mainInfo.put("bounds", widgetBoundsJson(mainWidget));
+                                            mainInfo.put("visible", !mainWidget.isHidden());
+                                            tutorial.put("main", mainInfo);
+                                            
+                                            // Name input widget: TutorialDisplayname.NAME (558.7)
+                                            Widget nameWidget = client.getWidget(558, 7);
+                                            if (nameWidget != null) {
+                                                java.util.Map<String, Object> nameInfo = new java.util.HashMap<>();
+                                                nameInfo.put("id", 36569095); // TutorialDisplayname.NAME
+                                                nameInfo.put("bounds", widgetBoundsJson(nameWidget));
+                                                nameInfo.put("visible", !nameWidget.isHidden());
+                                                nameInfo.put("text", safeText(nameWidget));
+                                                tutorial.put("nameInput", nameInfo);
+                                            }
+                                            
+                                            // Name text widget: TutorialDisplayname.NAME_TEXT (558.12)
+                                            Widget nameTextWidget = client.getWidget(558, 12);
+                                            if (nameTextWidget != null) {
+                                                java.util.Map<String, Object> nameTextInfo = new java.util.HashMap<>();
+                                                nameTextInfo.put("id", 36569100); // TutorialDisplayname.NAME_TEXT
+                                                nameTextInfo.put("bounds", widgetBoundsJson(nameTextWidget));
+                                                nameTextInfo.put("visible", !nameTextWidget.isHidden());
+                                                nameTextInfo.put("text", safeText(nameTextWidget));
+                                                tutorial.put("nameText", nameTextInfo);
+                                            }
+                                            
+                                            // Status widget: TutorialDisplayname.STATUS (558.13)
+                                            Widget statusWidget = client.getWidget(558, 13);
+                                            if (statusWidget != null) {
+                                                java.util.Map<String, Object> statusInfo = new java.util.HashMap<>();
+                                                statusInfo.put("id", 36569101); // TutorialDisplayname.STATUS
+                                                statusInfo.put("bounds", widgetBoundsJson(statusWidget));
+                                                statusInfo.put("visible", !statusWidget.isHidden());
+                                                statusInfo.put("text", safeText(statusWidget));
+                                                tutorial.put("status", statusInfo);
+                                            }
+                                            
+                                            // Set name widget: TutorialDisplayname.SET_NAME (558.19)
+                                            Widget setNameWidget = client.getWidget(558, 19);
+                                            if (setNameWidget != null) {
+                                                java.util.Map<String, Object> setNameInfo = new java.util.HashMap<>();
+                                                setNameInfo.put("id", 36569107); // TutorialDisplayname.SET_NAME
+                                                setNameInfo.put("bounds", widgetBoundsJson(setNameWidget));
+                                                setNameInfo.put("visible", !setNameWidget.isHidden());
+                                                setNameInfo.put("text", safeText(setNameWidget));
+                                                tutorial.put("setName", setNameInfo);
+                                            }
+                                        } else {
+                                            tutorial.put("interface", null);
+                                        }
+                                        
+                                        java.util.Map<String, Object> result = new java.util.HashMap<>();
+                                        result.put("ok", true);
+                                        result.put("tutorial", tutorial);
+                                        fut.complete(result);
+                                        
+                                    } catch (Exception e) {
+                                        java.util.Map<String, Object> result = new java.util.HashMap<>();
+                                        result.put("ok", false);
+                                        result.put("err", "tutorial-failed: " + e.getMessage());
+                                        fut.complete(result);
+                                    }
+                                });
+                                
+                                try {
+                                    java.util.Map<String, Object> result = fut.get(2, java.util.concurrent.TimeUnit.SECONDS);
+                                    out.println(gson.toJson(result));
+                                } catch (Exception e) {
+                                    out.println("{\"ok\":false,\"err\":\"tutorial-timeout\"}");
+                                }
                                 break;
                             }
 
@@ -1538,30 +6161,6 @@ public class IpcInputPlugin extends Plugin
 
         /* ======================= KEY/TYPE HELPERS ======================= */
 
-        private static int keyCodeFrom(String k)
-        {
-            switch (k.toUpperCase())
-            {
-                case "ESC":
-                case "ESCAPE": return java.awt.event.KeyEvent.VK_ESCAPE;
-                case "SPACE":  return java.awt.event.KeyEvent.VK_SPACE;
-                case "ENTER":
-                case "RETURN": return java.awt.event.KeyEvent.VK_ENTER;
-                case "TAB":    return java.awt.event.KeyEvent.VK_TAB;
-
-                // NEW: arrows & common nav
-                case "LEFT":   return java.awt.event.KeyEvent.VK_LEFT;
-                case "RIGHT":  return java.awt.event.KeyEvent.VK_RIGHT;
-                case "UP":     return java.awt.event.KeyEvent.VK_UP;
-                case "DOWN":   return java.awt.event.KeyEvent.VK_DOWN;
-                case "PAGEUP":   return java.awt.event.KeyEvent.VK_PAGE_UP;
-                case "PAGEDOWN": return java.awt.event.KeyEvent.VK_PAGE_DOWN;
-
-                default:
-                    char ch = k.toUpperCase().charAt(0);
-                    return java.awt.event.KeyEvent.getExtendedKeyCodeForChar(ch);
-            }
-        }
 
 
         private void typeStringAWT(Client client,
@@ -1681,6 +6280,10 @@ public class IpcInputPlugin extends Plugin
                         if (comp != null) {
                             door.put("name", comp.getName());
                         }
+                        
+                        // Add orientation A and B
+                        door.put("orientationA", wobj.getOrientationA());
+                        door.put("orientationB", wobj.getOrientationB());
 
 // Optional canvas bounds via convex hull (orientation hint too)
                         try {
@@ -1817,8 +6420,33 @@ public class IpcInputPlugin extends Plugin
             // Name + actions from composition
             final ObjectComposition comp = client.getObjectDefinition(id);
             String name = (comp != null) ? comp.getName() : null;
+            String[] actions = null;
+            
+            // Check for impostor IDs if name is null or empty
+            if (comp != null && (name == null || name.isEmpty() || "null".equals(name))) {
+                int[] impostorIds = comp.getImpostorIds();
+                if (impostorIds != null && impostorIds.length > 0) {
+                    // Try each impostor ID to find one with a valid name
+                    for (int impostorId : impostorIds) {
+                        if (impostorId != -1) {
+                            ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
+                            if (impostorComp != null) {
+                                String impostorName = impostorComp.getName();
+                                if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
+                                    name = impostorName;
+                                    actions = impostorComp.getActions();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (comp != null) {
+                actions = comp.getActions();
+            }
+            
             final String nmLower = (name != null) ? name.toLowerCase() : "";
-            if (!nmLower.contains(qLower)) return;
+            if (qLower != null && !qLower.isEmpty() && !nmLower.equals(qLower)) return;
 
             final Map<String,Object> row = new LinkedHashMap<>();
             row.put("id", id);
@@ -1826,13 +6454,10 @@ public class IpcInputPlugin extends Plugin
             row.put("name", name);
             row.put("world", java.util.Map.of("x", wx, "y", wy, "p", plane));
 
-            if (comp != null) {
-                String[] acts = comp.getActions();
-                if (acts != null) {
-                    java.util.List<String> al = new java.util.ArrayList<>();
-                    for (String a : acts) if (a != null) al.add(a);
-                    row.put("actions", al);
-                }
+            if (actions != null) {
+                java.util.List<String> al = new java.util.ArrayList<>();
+                for (String a : actions) if (a != null) al.add(a);
+                row.put("actions", al);
             }
 
             // bounds/canvas center from convex hull if present
@@ -1858,6 +6483,157 @@ public class IpcInputPlugin extends Plugin
 
             out.add(row);
         }
+
+        private void getAllNestedChildren(Widget parent, java.util.List<Widget> allChildren) {
+            if (parent == null) return;
+            
+            // Get static children
+            Widget[] staticChildren = parent.getStaticChildren();
+            if (staticChildren != null) {
+                for (Widget child : staticChildren) {
+                    if (child != null) {
+                        allChildren.add(child);
+                        // Recursively get children of this child
+                        getAllNestedChildren(child, allChildren);
+                    }
+                }
+            }
+            
+            // Get dynamic children
+            Widget[] dynamicChildren = parent.getDynamicChildren();
+            if (dynamicChildren != null) {
+                for (Widget child : dynamicChildren) {
+                    if (child != null) {
+                        allChildren.add(child);
+                        // Recursively get children of this child
+                        getAllNestedChildren(child, allChildren);
+                    }
+                }
+            }
+            
+            // For IF3 widgets, also get nested children
+            if (parent.isIf3()) {
+                Widget[] nestedChildren = parent.getNestedChildren();
+                if (nestedChildren != null) {
+                    for (Widget child : nestedChildren) {
+                        if (child != null) {
+                            allChildren.add(child);
+                            // Recursively get children of this child
+                            getAllNestedChildren(child, allChildren);
+                        }
+                    }
+                }
+            }
+        }
+
+        private void collectChildWidgets(Widget parent, java.util.List<java.util.Map<String,Object>> children) {
+            if (parent == null) return;
+            
+            try {
+                // Get all nested children recursively
+                java.util.List<Widget> allChildren = new java.util.ArrayList<>();
+                getAllNestedChildren(parent, allChildren);
+                
+                // Convert to data format and filter for visible widgets only
+                for (Widget child : allChildren) {
+                    if (child != null) {
+                        // Check visibility: not hidden AND has valid bounds AND valid canvas position
+                        boolean visible = false;
+                        java.awt.Rectangle bounds = null;
+                        net.runelite.api.Point canvasLocation = null;
+                        try {
+                            bounds = child.getBounds();
+                            canvasLocation = child.getCanvasLocation();
+                            boolean isHidden = child.isHidden();
+                            boolean hasValidBounds = (bounds != null && bounds.x >= 0 && bounds.y >= 0);
+                            boolean hasValidCanvasLocation = (canvasLocation != null && canvasLocation.getX() >= 0 && canvasLocation.getY() >= 0);
+                            visible = !isHidden && hasValidBounds && hasValidCanvasLocation;
+                        } catch (Exception ignored) {}
+                        
+                        // Only add visible widgets
+                        if (visible) {
+                            java.util.Map<String,Object> childData = new java.util.LinkedHashMap<>();
+                            childData.put("id", child.getId());
+                            
+                            // Get name safely
+                            try {
+                                String name = child.getName();
+                                childData.put("name", name != null ? name : "");
+                            } catch (Exception ignored) {
+                                childData.put("name", "");
+                            }
+                            
+                            // Get text safely
+                            try {
+                                String text = child.getText();
+                                childData.put("text", text != null ? text : "");
+                            } catch (Exception ignored) {
+                                childData.put("text", "");
+                            }
+                            
+                            childData.put("visible", visible);
+                            childData.put("hasListener", child.hasListener());
+                            childData.put("isIf3", child.isIf3());
+                            
+                            // Get sprite ID safely
+                            try {
+                                int spriteId = child.getSpriteId();
+                                childData.put("spriteId", spriteId);
+                            } catch (Exception ignored) {
+                                childData.put("spriteId", -1);
+                            }
+                            
+                            // Get item ID safely
+                            try {
+                                int itemId = child.getItemId();
+                                childData.put("itemId", itemId);
+                            } catch (Exception ignored) {
+                                childData.put("itemId", -1);
+                            }
+                            
+                            // Get OnOpListener safely
+                            try {
+                                Object onOpListener = child.getOnOpListener();
+                                childData.put("onOpListener", onOpListener);
+                            } catch (Exception ignored) {
+                                childData.put("onOpListener", null);
+                            }
+                            
+                            // Get text color safely
+                            try {
+                                int textColor = child.getTextColor();
+                                childData.put("textColor", String.format("%x", textColor));
+                            } catch (Exception ignored) {
+                                childData.put("textColor", "");
+                            }
+                            
+                            // Get bounds if available
+                            if (bounds != null) {
+                                childData.put("bounds", java.util.Map.of(
+                                        "x", bounds.x,
+                                        "y", bounds.y,
+                                        "width", bounds.width,
+                                        "height", bounds.height
+                                ));
+                            }
+                            
+                            // Get canvas location if available
+                            if (canvasLocation != null) {
+                                childData.put("canvasLocation", java.util.Map.of(
+                                        "x", canvasLocation.getX(),
+                                        "y", canvasLocation.getY()
+                                ));
+                            }
+                            
+                            children.add(childData);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                System.out.println("[DEBUG] Error accessing child widgets: " + e.getMessage());
+            }
+        }
+
 
         // A tile is hard-blocked (solid object etc.)
         private static boolean hardBlocked(int[][] flags, int x, int y)
@@ -1914,10 +6690,47 @@ public class IpcInputPlugin extends Plugin
 
             // Diagonals require both adjacent cardinals to be valid steps (no corner cut).
             // We reuse canStep() so doors on either cardinal edge also soften those checks.
-            if (dx == 1 && dy == 1)   return canStep(flags, doorHere, x, y, 1, 0)   && canStep(flags, doorHere, x, y, 0, 1);
-            if (dx == 1 && dy == -1)  return canStep(flags, doorHere, x, y, 1, 0)   && canStep(flags, doorHere, x, y, 0, -1);
-            if (dx == -1 && dy == 1)  return canStep(flags, doorHere, x, y, -1, 0)  && canStep(flags, doorHere, x, y, 0, 1);
-            if (dx == -1 && dy == -1) return canStep(flags, doorHere, x, y, -1, 0)  && canStep(flags, doorHere, x, y, 0, -1);
+            // Additionally, check corner tiles that the diagonal path passes through.
+            if (dx == 1 && dy == 1) {
+                // Northeast diagonal: check cardinal moves AND corner tiles
+                boolean cardinalValid = canStep(flags, doorHere, x, y, 1, 0) && canStep(flags, doorHere, x, y, 0, 1);
+                if (!cardinalValid) return false;
+                
+                // Check corner tiles: (x+1, y) north wall and (x, y+1) east wall
+                boolean corner1Blocked = (flags[x+1][y] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_NORTH) != 0;
+                boolean corner2Blocked = (flags[x][y+1] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_EAST) != 0;
+                return !(corner1Blocked || corner2Blocked);
+            }
+            if (dx == 1 && dy == -1) {
+                // Southeast diagonal: check cardinal moves AND corner tiles
+                boolean cardinalValid = canStep(flags, doorHere, x, y, 1, 0) && canStep(flags, doorHere, x, y, 0, -1);
+                if (!cardinalValid) return false;
+                
+                // Check corner tiles: (x+1, y) south wall and (x, y-1) east wall
+                boolean corner1Blocked = (flags[x+1][y] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_SOUTH) != 0;
+                boolean corner2Blocked = (flags[x][y-1] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_EAST) != 0;
+                return !(corner1Blocked || corner2Blocked);
+            }
+            if (dx == -1 && dy == 1) {
+                // Northwest diagonal: check cardinal moves AND corner tiles
+                boolean cardinalValid = canStep(flags, doorHere, x, y, -1, 0) && canStep(flags, doorHere, x, y, 0, 1);
+                if (!cardinalValid) return false;
+                
+                // Check corner tiles: (x-1, y) north wall and (x, y+1) west wall
+                boolean corner1Blocked = (flags[x-1][y] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_NORTH) != 0;
+                boolean corner2Blocked = (flags[x][y+1] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_WEST) != 0;
+                return !(corner1Blocked || corner2Blocked);
+            }
+            if (dx == -1 && dy == -1) {
+                // Southwest diagonal: check cardinal moves AND corner tiles
+                boolean cardinalValid = canStep(flags, doorHere, x, y, -1, 0) && canStep(flags, doorHere, x, y, 0, -1);
+                if (!cardinalValid) return false;
+                
+                // Check corner tiles: (x-1, y) south wall and (x, y-1) west wall
+                boolean corner1Blocked = (flags[x-1][y] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_SOUTH) != 0;
+                boolean corner2Blocked = (flags[x][y-1] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_WEST) != 0;
+                return !(corner1Blocked || corner2Blocked);
+            }
 
             return false;
         }
@@ -1936,7 +6749,10 @@ public class IpcInputPlugin extends Plugin
             // click
             Integer x;
             Integer y;
+            Integer plane;
             Integer button;
+            @SerializedName("hover_only")
+            Boolean hoverOnly;
 
             // key
             @SerializedName("k")
@@ -1950,6 +6766,7 @@ public class IpcInputPlugin extends Plugin
             @SerializedName("goalX") Integer goalX;
             @SerializedName("goalY") Integer goalY;
             @SerializedName("maxWps") Integer maxWps;
+            @SerializedName("visualize") Boolean visualize;
 
             // mask
             @SerializedName("radius") Integer radius;
@@ -1973,16 +6790,125 @@ public class IpcInputPlugin extends Plugin
             @SerializedName("amount") Integer amount;
 
             @SerializedName("key") String key;   // e.g. "LEFT", "RIGHT", "esc"
+            
+            // world hopping
+            @SerializedName("world_id") Integer world_id;
             @SerializedName("ms")  Integer ms;   // hold duration in milliseconds
 
             @SerializedName("types") List<String> types; // e.g. ["WALL","GAME","DECOR"]
             @SerializedName("name")   String name;
+            @SerializedName("exactMatch") Boolean exactMatch; // For exact vs contains matching
 
             // get-var
             @SerializedName("id")   Integer id;    // varbit/varp id
             @SerializedName("kind") String  kind;  // "varbit" (default) or "varp"
+            
+            // get-varc-int
+            @SerializedName("var_id") Integer var_id;  // varc int id
+            
+            // widget commands
+            @SerializedName("widget_id") Integer widget_id;  // widget ID for widget commands
+            
+            // door state commands
+            @SerializedName("door_x") Integer door_x;
+            @SerializedName("door_y") Integer door_y;
+            @SerializedName("door_p") Integer door_p;
 
 
+        }
+    }
+    
+
+        private static int keyCodeFrom(String key) {
+            if (key == null) return -1;
+            
+            switch (key.toUpperCase()) {
+                case "ENTER": return java.awt.event.KeyEvent.VK_ENTER;
+                case "ESC": case "ESCAPE": return java.awt.event.KeyEvent.VK_ESCAPE;
+                case "BACKSPACE": return java.awt.event.KeyEvent.VK_BACK_SPACE;
+                case "SPACE": case "SPACEBAR": return java.awt.event.KeyEvent.VK_SPACE;
+                case "TAB": return java.awt.event.KeyEvent.VK_TAB;
+                case "SHIFT": return java.awt.event.KeyEvent.VK_SHIFT;
+                case "CTRL": case "CONTROL": return java.awt.event.KeyEvent.VK_CONTROL;
+                case "ALT": return java.awt.event.KeyEvent.VK_ALT;
+                case "UP": return java.awt.event.KeyEvent.VK_UP;
+                case "DOWN": return java.awt.event.KeyEvent.VK_DOWN;
+                case "LEFT": return java.awt.event.KeyEvent.VK_LEFT;
+                case "RIGHT": return java.awt.event.KeyEvent.VK_RIGHT;
+                case "F1": return java.awt.event.KeyEvent.VK_F1;
+                case "F2": return java.awt.event.KeyEvent.VK_F2;
+                case "F3": return java.awt.event.KeyEvent.VK_F3;
+                case "F4": return java.awt.event.KeyEvent.VK_F4;
+                case "F5": return java.awt.event.KeyEvent.VK_F5;
+                case "F6": return java.awt.event.KeyEvent.VK_F6;
+                case "F7": return java.awt.event.KeyEvent.VK_F7;
+                case "F8": return java.awt.event.KeyEvent.VK_F8;
+                case "F9": return java.awt.event.KeyEvent.VK_F9;
+                case "F10": return java.awt.event.KeyEvent.VK_F10;
+                case "F11": return java.awt.event.KeyEvent.VK_F11;
+                case "F12": return java.awt.event.KeyEvent.VK_F12;
+                default:
+                    // For single character keys, return the character code
+                    if (key.length() == 1) {
+                        return java.awt.event.KeyEvent.getExtendedKeyCodeForChar(key.charAt(0));
+                    }
+                    return -1;
+            }
+        }
+
+        private static String getTabName(int tabIndex) {
+        switch (tabIndex) {
+            case 0: return "COMBAT";              // STONE0
+            case 1: return "SKILLS";              // STONE1
+            case 2: return "QUESTS";              // STONE2
+            case 3: return "INVENTORY";           // STONE3
+            case 4: return "EQUIPMENT";           // STONE4
+            case 5: return "PRAYER";              // STONE5
+            case 6: return "SPELLBOOK";           // STONE6
+            case 7: return "CHAT-CHANNEL";        // STONE7
+            case 8: return "ACCOUNT_MANAGEMENT";  // STONE8
+            case 9: return "FRIENDS_LIST";        // STONE9
+            case 10: return "SETTINGS";           // STONE11 (STONE10 skipped)
+            case 11: return "EMOTES";             // STONE12
+            case 12: return "MUSIC";              // STONE13
+            case -1: return "UNKNOWN";            // Tab detection not working
+            default: return "UNKNOWN";
+        }
+    }
+
+    // Helper methods for tutorial widget data
+    private static java.util.Map<String, Object> widgetBoundsJson(Widget w) {
+        if (w == null) {
+            return null;
+        }
+
+        java.util.Map<String, Object> out = new java.util.HashMap<>();
+
+        // AWT bounds rectangle
+        Rectangle r = w.getBounds();
+        if (r != null) {
+            java.util.Map<String, Object> rect = new java.util.HashMap<>();
+            rect.put("x", r.x);
+            rect.put("y", r.y);
+            rect.put("width", r.width);
+            rect.put("height", r.height);
+            out.put("bounds", rect);
+        } else {
+            out.put("bounds", null);
+        }
+
+        return out;
+    }
+
+    private static String safeText(Widget w) {
+        if (w == null) {
+            return "";
+        }
+        try {
+            String t = w.getText();
+            return (t != null) ? t : "";
+        } catch (Exception ignored) {
+            return "";
         }
     }
 }
