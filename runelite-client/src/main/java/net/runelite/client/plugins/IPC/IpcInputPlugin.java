@@ -30,6 +30,7 @@ import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetInfo;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.game.WorldService;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
@@ -54,9 +55,10 @@ public class IpcInputPlugin extends Plugin
     @Inject private Client client;
     @Inject private ClientThread clientThread;
     @Inject private IpcInputConfig config;
+    @Inject private WorldService worldService;
 
     @Inject private OverlayManager overlayManager;
-    private CollisionOverlay collisionOverlay;
+    // private CollisionOverlay collisionOverlay; // Disabled - was causing lag
     private PathOverlay pathOverlay;
 
     private ServerThread serverThread;
@@ -84,9 +86,9 @@ public class IpcInputPlugin extends Plugin
     {
         final int port = config.port();
 
-        collisionOverlay = new CollisionOverlay(client);
+        // collisionOverlay = new CollisionOverlay(client); // Disabled - was causing lag
         pathOverlay = new PathOverlay(client);
-        overlayManager.add(collisionOverlay);
+        // overlayManager.add(collisionOverlay); // Disabled - was causing lag
         overlayManager.add(pathOverlay);
 
         try {
@@ -122,11 +124,11 @@ public class IpcInputPlugin extends Plugin
             overlayManager.remove(pathOverlay);
             pathOverlay = null;
         }
-        if (collisionOverlay != null)
-        {
-            overlayManager.remove(collisionOverlay);
-            collisionOverlay = null;
-        }
+        // if (collisionOverlay != null) // Disabled - was causing lag
+        // {
+        //     overlayManager.remove(collisionOverlay);
+        //     collisionOverlay = null;
+        // }
 
         log.info("IPC Input stopped");
     }
@@ -207,35 +209,53 @@ public class IpcInputPlugin extends Plugin
             return (t == null || t.getMessage() == null) ? t.toString() : t.getMessage();
         }
 
-        private static java.util.Map<String,Object> createObjectData(TileObject obj, String objectType, int baseX, int baseY, int plane, Client client, String needle) {
-            final java.util.Map<String,Object> objData = new java.util.LinkedHashMap<>();
-            
-            final int id = obj.getId();
-            final ObjectComposition comp = client.getObjectDefinition(id);
-            String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
-            String[] actions = null;
-            
-            // Handle impostor IDs
-            if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
-                int[] impostorIds = comp.getImpostorIds();
+        /**
+         * Resolve the effective ObjectComposition for a TileObject.
+         *
+         * Some objects (notably certain GroundObjects like the MLM Sack) have a base definition
+         * whose name/actions are "null", but a real, interactable definition via getImpostor().
+         *
+         * Priority:
+         *  1) comp.getImpostor() if non-null
+         *  2) fallback scan of impostorIds for a non-null name
+         *  3) base comp
+         */
+        private static ObjectComposition resolveObjectComposition(Client client, ObjectComposition comp) {
+            if (comp == null) return null;
+            try {
+                final ObjectComposition imp = comp.getImpostor();
+                if (imp != null) return imp;
+            } catch (Exception ignored) {}
+
+            try {
+                final String nm = comp.getName();
+                if (nm == null || nm.isEmpty() || "null".equalsIgnoreCase(nm)) {
+                    final int[] impostorIds = comp.getImpostorIds();
                 if (impostorIds != null && impostorIds.length > 0) {
                     for (int impostorId : impostorIds) {
-                        if (impostorId != -1) {
-                            ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
-                            if (impostorComp != null) {
-                                String impostorName = impostorComp.getName();
-                                if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
-                                    nm = impostorName;
-                                    actions = impostorComp.getActions();
-                                    break;
-                                }
+                            if (impostorId == -1) continue;
+                            final ObjectComposition ic = client.getObjectDefinition(impostorId);
+                            if (ic == null) continue;
+                            final String in = ic.getName();
+                            if (in != null && !in.isEmpty() && !"null".equalsIgnoreCase(in)) {
+                                return ic;
                             }
                         }
                     }
                 }
-            } else if (comp != null) {
-                actions = comp.getActions();
-            }
+            } catch (Exception ignored) {}
+
+            return comp;
+        }
+
+        private static java.util.Map<String,Object> createObjectData(TileObject obj, String objectType, int baseX, int baseY, int plane, Client client, String needle) {
+            final java.util.Map<String,Object> objData = new java.util.LinkedHashMap<>();
+            
+            final int id = obj.getId();
+            final ObjectComposition baseComp = client.getObjectDefinition(id);
+            final ObjectComposition comp = resolveObjectComposition(client, baseComp);
+            String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
+            String[] actions = (comp != null) ? comp.getActions() : null;
 
             final int wx = baseX + obj.getLocalLocation().getSceneX();
             final int wy = baseY + obj.getLocalLocation().getSceneY();
@@ -438,7 +458,7 @@ public class IpcInputPlugin extends Plugin
                                     }
                                 } catch (Throwable ignored) {}
                                 // Advertise supported cmds to help you spot version skew
-                                resp.put("cmds", new String[]{"ping","click","scroll","path","project","objects","npcs","tab","hovered","widget_exists","get_widget","get_widget_info","get_widget_children","get_bank_items","get_bank_tabs","get_bank_quantity_buttons","get_bank_deposit_buttons","get_bank_note_toggle","get_bank_search","bank-xvalue","get_ge_widgets","get_ge_offers","get_ge_setup","get_ge_confirm","get_ge_buttons","door_state","get_player","get_equipment","get_equipment_inventory","get_spellbook","get_camera","find_object","find_object_by_path","find_npc","scan_scene","detect_water","get_tutorial","get_game_state","get_world","hop_world"});
+                                resp.put("cmds", new String[]{"ping","click","scroll","path","project","objects","npcs","tab","hovered","widget_exists","get_widget","get_widget_info","get_widget_children","get_bank_items","get_bank_tabs","get_bank_quantity_buttons","get_bank_deposit_buttons","get_bank_note_toggle","get_bank_search","bank-xvalue","get_ge_widgets","get_ge_offers","get_ge_setup","get_ge_confirm","get_ge_buttons","door_state","get_player","get_equipment","get_equipment_inventory","get_spellbook","get_camera","find_object","find_object_by_path","find_npc","scan_scene","detect_water","get_tutorial","get_game_state","get_world","get_worlds","hop_world"});
                                 out.println(gson.toJson(resp));
                                 break;
                             }
@@ -473,6 +493,68 @@ public class IpcInputPlugin extends Plugin
                                     resp.put("err", "get-world-failed");
                                 }
                                 out.println(gson.toJson(resp));
+                                break;
+                            }
+
+                            case "get_worlds": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        final net.runelite.http.api.worlds.WorldResult wr =
+                                                (plugin.worldService != null) ? plugin.worldService.getWorlds() : null;
+
+                                        java.util.List<java.util.Map<String,Object>> worldsOut = new java.util.ArrayList<>();
+                                        if (wr != null && wr.getWorlds() != null) {
+                                            for (net.runelite.http.api.worlds.World w : wr.getWorlds()) {
+                                                if (w == null) continue;
+                                                boolean members = false;
+                                                try {
+                                                    java.util.Set<net.runelite.http.api.worlds.WorldType> types = w.getTypes();
+                                                    members = (types != null && types.contains(net.runelite.http.api.worlds.WorldType.MEMBERS));
+                                                } catch (Throwable ignored) {}
+
+                                                java.util.Map<String,Object> row = new java.util.LinkedHashMap<>();
+                                                row.put("id", w.getId());
+                                                row.put("members", members);
+                                                try {
+                                                    java.util.Set<net.runelite.http.api.worlds.WorldType> types = w.getTypes();
+                                                    if (types != null) {
+                                                        java.util.List<String> ts = new java.util.ArrayList<>();
+                                                        for (net.runelite.http.api.worlds.WorldType t : types) if (t != null) ts.add(t.name());
+                                                        row.put("types", ts);
+                                                    } else {
+                                                        row.put("types", java.util.Collections.emptyList());
+                                                    }
+                                                } catch (Throwable ignored) {
+                                                    row.put("types", java.util.Collections.emptyList());
+                                                }
+
+                                                worldsOut.add(row);
+                                            }
+                                        }
+
+                                        resp.put("ok", true);
+                                        resp.put("count", worldsOut.size());
+                                        resp.put("worlds", worldsOut);
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-worlds-failed");
+                                        resp.put("exception", t.getMessage());
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
                                 break;
                             }
 
@@ -559,12 +641,17 @@ public class IpcInputPlugin extends Plugin
                                         client.getGameState() == GameState.LOGIN_SCREEN ||
                                                 client.getGameState() == GameState.LOGIN_SCREEN_AUTHENTICATOR;
 
-                                out.println("{\"ok\":true,\"mode\":\"" + (onLogin ? "AWT_LOGIN" : "AWT") + "\",\"hoverDelayMs\":" + hoverDelay + "}");
+                                // Use CompletableFuture to capture tile after click
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
 
                                 javax.swing.SwingUtilities.invokeLater(() -> {
                                     try {
                                         java.awt.Component comp = (java.awt.Component) client.getCanvas();
-                                        if (comp == null) return;
+                                        if (comp == null) {
+                                            fut.complete(java.util.Map.of("ok", false, "err", "no-canvas"));
+                                            return;
+                                        }
 
                                         // Login screen handling
                                         if (onLogin) {
@@ -572,10 +659,11 @@ public class IpcInputPlugin extends Plugin
                                             if (cx < 0 || cy < 0 || cx >= comp.getWidth() || cy >= comp.getHeight()) {
                                                 log.info("login-click OOB: canvas={}x{} target=({}, {})",
                                                         comp.getWidth(), comp.getHeight(), cx, cy);
+                                                fut.complete(java.util.Map.of("ok", false, "err", "out-of-bounds"));
                                                 return;
                                             }
 
-                                            // --- LOGIN: post events via AWT System EventQueue (don’t dispatch directly) ---
+                                            // --- LOGIN: post events via AWT System EventQueue (don't dispatch directly) ---
                                             final java.awt.EventQueue q = java.awt.Toolkit.getDefaultToolkit().getSystemEventQueue();
                                             final long t0 = System.currentTimeMillis();
 
@@ -611,6 +699,7 @@ public class IpcInputPlugin extends Plugin
                                                         cx, cy, 1, false, awtButton));
                                             }
 
+                                            fut.complete(java.util.Map.of("ok", true, "mode", "AWT_LOGIN", "hoverDelayMs", hoverDelay));
                                             return; // login handled; skip in-game path
                                         }
 
@@ -637,14 +726,85 @@ public class IpcInputPlugin extends Plugin
                                                         comp, java.awt.event.MouseEvent.MOUSE_RELEASED, t0+5, modMask, cx, cy, 1, false, awtButton));
                                                 comp.dispatchEvent(new java.awt.event.MouseEvent(
                                                         comp, java.awt.event.MouseEvent.MOUSE_CLICKED,  t0+10, 0,      cx, cy, 1, false, awtButton));
+                                                
+                                                // After click completes, wait a bit and capture the tile
+                                                javax.swing.Timer tileTimer = new javax.swing.Timer(50, ev2 -> {
+                                                    clientThread.invokeLater(() -> {
+                                                        java.util.Map<String, Object> resp = new java.util.LinkedHashMap<>();
+                                                        resp.put("ok", true);
+                                                        resp.put("mode", "AWT");
+                                                        resp.put("hoverDelayMs", hoverDelay);
+                                                        
+                                                        // Capture the clicked tile
+                                                        Tile clickedTile = client.getSelectedSceneTile();
+                                                        if (clickedTile != null) {
+                                                            WorldPoint worldPos = clickedTile.getWorldLocation();
+                                                            if (worldPos != null) {
+                                                                java.util.Map<String, Object> tileData = new java.util.LinkedHashMap<>();
+                                                                tileData.put("x", worldPos.getX());
+                                                                tileData.put("y", worldPos.getY());
+                                                                tileData.put("plane", worldPos.getPlane());
+                                                                resp.put("tile", tileData);
+                                                            } else {
+                                                                resp.put("tile", null);
+                                                            }
+                                                        } else {
+                                                            resp.put("tile", null);
+                                                        }
+                                                        
+                                                        fut.complete(resp);
+                                                    });
+                                                });
+                                                tileTimer.setRepeats(false);
+                                                tileTimer.start();
                                             });
                                             t.setRepeats(false);
                                             t.start();
+                                        } else {
+                                            // Hover only - still capture tile
+                                            javax.swing.Timer tileTimer = new javax.swing.Timer(50, ev -> {
+                                                clientThread.invokeLater(() -> {
+                                                    java.util.Map<String, Object> resp = new java.util.LinkedHashMap<>();
+                                                    resp.put("ok", true);
+                                                    resp.put("mode", "AWT");
+                                                    resp.put("hoverDelayMs", hoverDelay);
+                                                    
+                                                    Tile clickedTile = client.getSelectedSceneTile();
+                                                    if (clickedTile != null) {
+                                                        WorldPoint worldPos = clickedTile.getWorldLocation();
+                                                        if (worldPos != null) {
+                                                            java.util.Map<String, Object> tileData = new java.util.LinkedHashMap<>();
+                                                            tileData.put("x", worldPos.getX());
+                                                            tileData.put("y", worldPos.getY());
+                                                            tileData.put("plane", worldPos.getPlane());
+                                                            resp.put("tile", tileData);
+                                                        } else {
+                                                            resp.put("tile", null);
+                                                        }
+                                                    } else {
+                                                        resp.put("tile", null);
+                                                    }
+                                                    
+                                                    fut.complete(resp);
+                                                });
+                                            });
+                                            tileTimer.setRepeats(false);
+                                            tileTimer.start();
                                         }
                                     } catch (Exception e) {
                                         log.warn("click handler failed: {}", e.toString());
+                                        fut.complete(java.util.Map.of("ok", false, "err", e.toString()));
                                     }
                                 });
+                                
+                                // Wait for result and send response
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
                                 break;
                             }
 
@@ -668,6 +828,51 @@ public class IpcInputPlugin extends Plugin
                                     } catch (Throwable t) {
                                         resp.put("ok", false);
                                         resp.put("err", "get-last-interaction-failed");
+                                    } finally {
+                                        fut.complete(resp);
+                                    }
+                                });
+                                
+                                java.util.Map<String,Object> result;
+                                try {
+                                    result = fut.get(150, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (Exception e) {
+                                    result = java.util.Map.of("ok", false, "err", "timeout");
+                                }
+                                out.println(gson.toJson(result));
+                                break;
+                            }
+
+                            case "get_selected_tile": {
+                                final java.util.concurrent.CompletableFuture<java.util.Map<String,Object>> fut =
+                                        new java.util.concurrent.CompletableFuture<>();
+                                
+                                clientThread.invokeLater(() -> {
+                                    final java.util.Map<String,Object> resp = new java.util.LinkedHashMap<>();
+                                    try {
+                                        // Get the currently selected scene tile from the game
+                                        Tile selectedTile = client.getSelectedSceneTile();
+                                        if (selectedTile != null) {
+                                            WorldPoint worldPos = selectedTile.getWorldLocation();
+                                            if (worldPos != null) {
+                                                java.util.Map<String, Object> tileData = new java.util.LinkedHashMap<>();
+                                                tileData.put("x", worldPos.getX());
+                                                tileData.put("y", worldPos.getY());
+                                                tileData.put("plane", worldPos.getPlane());
+                                                resp.put("ok", true);
+                                                resp.put("tile", tileData);
+                                            } else {
+                                                resp.put("ok", true);
+                                                resp.put("tile", null);
+                                            }
+                                        } else {
+                                            resp.put("ok", true);
+                                            resp.put("tile", null);
+                                        }
+                                        
+                                    } catch (Throwable t) {
+                                        resp.put("ok", false);
+                                        resp.put("err", "get-selected-tile-failed");
                                     } finally {
                                         fut.complete(resp);
                                     }
@@ -732,6 +937,9 @@ public class IpcInputPlugin extends Plugin
                                                     
                                                     // Animation
                                                     playerData.put("animation", player.getAnimation());
+                                                    
+                                                    // Orientation (facing direction in degrees, 0-2047)
+                                                    playerData.put("orientation", player.getOrientation());
                                                     
                                                     // Health info
                                                     playerData.put("healthRatio", player.getHealthRatio());
@@ -1087,32 +1295,10 @@ public class IpcInputPlugin extends Plugin
                                         java.util.function.BiConsumer<String, TileObject> addObj = (kind, obj) -> {
                                             if (obj == null) return;
                                             final int id = obj.getId();
-                                            final ObjectComposition comp = client.getObjectDefinition(id);
+                                            final ObjectComposition baseComp = client.getObjectDefinition(id);
+                                            final ObjectComposition comp = resolveObjectComposition(client, baseComp);
                                             String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
-                                            String[] actions = null;
-                                            
-                                            // Check for impostor IDs if name is null or empty
-                                            if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
-                                                int[] impostorIds = comp.getImpostorIds();
-                                                if (impostorIds != null && impostorIds.length > 0) {
-                                                    // Try each impostor ID to find one with a valid name
-                                                    for (int impostorId : impostorIds) {
-                                                        if (impostorId != -1) {
-                                                            ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
-                                                            if (impostorComp != null) {
-                                                                String impostorName = impostorComp.getName();
-                                                                if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
-                                                                    nm = impostorName;
-                                                                    actions = impostorComp.getActions();
-                                                                    break;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            } else if (comp != null) {
-                                                actions = comp.getActions();
-                                            }
+                                            String[] actions = (comp != null) ? comp.getActions() : null;
                                             
                                             final String nmLower = nm.toLowerCase();
                                             if (!needle.isEmpty() && !nmLower.equals(needle)) return;
@@ -1129,6 +1315,34 @@ public class IpcInputPlugin extends Plugin
                                             row.put("actions", actions);
                                             row.put("world", java.util.Map.of("x", wx, "y", wy, "p", plane));
                                             row.put("distance", Math.abs(wx - myWx) + Math.abs(wy - myWy));
+                                            row.put("plane", plane);
+
+                                            // Get modelHeight and vertexHeight from Renderable (only for GameObject)
+                                            try {
+                                                if (obj instanceof net.runelite.api.GameObject) {
+                                                    final net.runelite.api.GameObject go = (net.runelite.api.GameObject)obj;
+                                                    final Renderable rend = go.getRenderable();
+                                                    if (rend != null) {
+                                                        final int modelHeight = rend.getModelHeight();
+                                                        row.put("modelHeight", modelHeight);
+                                                        
+                                                        // Calculate vertexHeight from model vertices
+                                                        final Model m = rend.getModel();
+                                                        if (m != null) {
+                                                            final float[] ys = m.getVerticesY();
+                                                            if (ys != null && ys.length > 0) {
+                                                                float min = ys[0], max = ys[0];
+                                                                for (float y : ys) {
+                                                                    if (y < min) min = y;
+                                                                    if (y > max) max = y;
+                                                                }
+                                                                final float vertexHeight = max - min;
+                                                                row.put("vertexHeight", vertexHeight);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            } catch (Exception ignored) {}
 
                                             // convex hull bounds + orientation + canvas fallback
                                             try {
@@ -1257,6 +1471,15 @@ public class IpcInputPlugin extends Plugin
                                             row.put("world", java.util.Map.of("x", wx, "y", wy, "p", plane));
                                             row.put("distance", Math.abs(wx - myWx) + Math.abs(wy - myWy));
                                             
+                                            // Health info (only known when a health bar is active; otherwise -1/-1)
+                                            try {
+                                                row.put("healthRatio", npc.getHealthRatio());
+                                                row.put("healthScale", npc.getHealthScale());
+                                            } catch (Throwable ignored) {
+                                                row.put("healthRatio", -1);
+                                                row.put("healthScale", -1);
+                                            }
+                                            
                                             // Add combat status
                                             Actor interacting = npc.getInteracting();
                                             boolean inCombat = (interacting != null);
@@ -1360,27 +1583,9 @@ public class IpcInputPlugin extends Plugin
                                         java.util.function.Predicate<TileObject> nameMatches = (obj) -> {
                                             if (obj == null) return false;
                                             final int id = obj.getId();
-                                            final ObjectComposition comp = client.getObjectDefinition(id);
+                                            final ObjectComposition baseComp = client.getObjectDefinition(id);
+                                            final ObjectComposition comp = resolveObjectComposition(client, baseComp);
                                             String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
-                                            
-                                            // Check for impostor IDs if name is null or empty
-                                            if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
-                                                int[] impostorIds = comp.getImpostorIds();
-                                                if (impostorIds != null && impostorIds.length > 0) {
-                                                    for (int impostorId : impostorIds) {
-                                                        if (impostorId != -1) {
-                                                            ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
-                                                            if (impostorComp != null) {
-                                                                String impostorName = impostorComp.getName();
-                                                                if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
-                                                                    nm = impostorName;
-                                                                    break;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
                                             
                                             final String nmLower = nm.toLowerCase();
                                             if (needle.isEmpty()) return true;
@@ -1432,31 +1637,10 @@ public class IpcInputPlugin extends Plugin
                                                 if (obj != null && nameMatches.test(obj)) {
                                                     // Add to candidates list for later selection
                                                     final int id = obj.getId();
-                                                    final ObjectComposition comp = client.getObjectDefinition(id);
+                                                    final ObjectComposition baseComp = client.getObjectDefinition(id);
+                                                    final ObjectComposition comp = resolveObjectComposition(client, baseComp);
                                                     String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
-                                                    String[] actions = null;
-                                                    
-                                                    // Handle impostor IDs
-                                                    if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
-                                                        int[] impostorIds = comp.getImpostorIds();
-                                                        if (impostorIds != null && impostorIds.length > 0) {
-                                                            for (int impostorId : impostorIds) {
-                                                                if (impostorId != -1) {
-                                                                    ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
-                                                                    if (impostorComp != null) {
-                                                                        String impostorName = impostorComp.getName();
-                                                                        if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
-                                                                            nm = impostorName;
-                                                                            actions = impostorComp.getActions();
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    } else if (comp != null) {
-                                                        actions = comp.getActions();
-                                                    }
+                                                    String[] actions = (comp != null) ? comp.getActions() : null;
 
                                                     final int wx = baseX + obj.getLocalLocation().getSceneX();
                                                     final int wy = baseY + obj.getLocalLocation().getSceneY();
@@ -1597,27 +1781,9 @@ public class IpcInputPlugin extends Plugin
                                         java.util.function.Predicate<TileObject> nameMatches = (obj) -> {
                                             if (obj == null) return false;
                                             final int id = obj.getId();
-                                            final ObjectComposition comp = client.getObjectDefinition(id);
+                                            final ObjectComposition baseComp = client.getObjectDefinition(id);
+                                            final ObjectComposition comp = resolveObjectComposition(client, baseComp);
                                             String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
-                                            
-                                            // Check for impostor IDs if name is null or empty
-                                            if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
-                                                int[] impostorIds = comp.getImpostorIds();
-                                                if (impostorIds != null && impostorIds.length > 0) {
-                                                    for (int impostorId : impostorIds) {
-                                                        if (impostorId != -1) {
-                                                            ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
-                                                            if (impostorComp != null) {
-                                                                String impostorName = impostorComp.getName();
-                                                                if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
-                                                                    nm = impostorName;
-                                                                    break;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
                                             
                                             final String nmLower = nm.toLowerCase();
                                             if (needle.isEmpty()) return true;
@@ -1902,27 +2068,9 @@ public class IpcInputPlugin extends Plugin
                                         java.util.function.Predicate<TileObject> nameMatches = (obj) -> {
                                             if (obj == null) return false;
                                             final int id = obj.getId();
-                                            final ObjectComposition comp = client.getObjectDefinition(id);
+                                            final ObjectComposition baseComp = client.getObjectDefinition(id);
+                                            final ObjectComposition comp = resolveObjectComposition(client, baseComp);
                                             String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
-                                            
-                                            // Check for impostor IDs if name is null or empty
-                                            if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
-                                                int[] impostorIds = comp.getImpostorIds();
-                                                if (impostorIds != null && impostorIds.length > 0) {
-                                                    for (int impostorId : impostorIds) {
-                                                        if (impostorId != -1) {
-                                                            ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
-                                                            if (impostorComp != null) {
-                                                                String impostorName = impostorComp.getName();
-                                                                if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
-                                                                    nm = impostorName;
-                                                                    break;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
                                             
                                             final String nmLower = nm.toLowerCase();
                                             if (needle.isEmpty()) return true;
@@ -1972,31 +2120,10 @@ public class IpcInputPlugin extends Plugin
                                                 if (obj != null && nameMatches.test(obj)) {
                                                     // Add to candidates list for later selection
                                                     final int id = obj.getId();
-                                                    final ObjectComposition comp = client.getObjectDefinition(id);
+                                                    final ObjectComposition baseComp = client.getObjectDefinition(id);
+                                                    final ObjectComposition comp = resolveObjectComposition(client, baseComp);
                                                     String nm = (comp != null && comp.getName() != null) ? comp.getName() : "";
-                                                    String[] actions = null;
-                                                    
-                                                    // Handle impostor IDs
-                                                    if (comp != null && (nm == null || nm.isEmpty() || "null".equals(nm))) {
-                                                        int[] impostorIds = comp.getImpostorIds();
-                                                        if (impostorIds != null && impostorIds.length > 0) {
-                                                            for (int impostorId : impostorIds) {
-                                                                if (impostorId != -1) {
-                                                                    ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
-                                                                    if (impostorComp != null) {
-                                                                        String impostorName = impostorComp.getName();
-                                                                        if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
-                                                                            nm = impostorName;
-                                                                            actions = impostorComp.getActions();
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    } else if (comp != null) {
-                                                        actions = comp.getActions();
-                                                    }
+                                                    String[] actions = (comp != null) ? comp.getActions() : null;
 
                                                     final int wx = baseX + obj.getLocalLocation().getSceneX();
                                                     final int wy = baseY + obj.getLocalLocation().getSceneY();
@@ -2147,6 +2274,15 @@ public class IpcInputPlugin extends Plugin
                                             npcData.put("actions", (comp != null) ? comp.getActions() : null);
                                             npcData.put("world", java.util.Map.of("x", wx, "y", wy, "p", plane));
                                             npcData.put("distance", Math.abs(wx - myWx) + Math.abs(wy - myWy));
+                                            
+                                            // Health info (only known when a health bar is active; otherwise -1/-1)
+                                            try {
+                                                npcData.put("healthRatio", npc.getHealthRatio());
+                                                npcData.put("healthScale", npc.getHealthScale());
+                                            } catch (Throwable ignored) {
+                                                npcData.put("healthRatio", -1);
+                                                npcData.put("healthScale", -1);
+                                            }
                                             
                                             // Add combat status
                                             Actor interacting = npc.getInteracting();
@@ -4384,6 +4520,9 @@ public class IpcInputPlugin extends Plugin
                                         player.put("combatLevel", localPlayer.getCombatLevel());
                                         player.put("animation", localPlayer.getAnimation());
                                         
+                                        // Orientation (facing direction in degrees, 0-2047)
+                                        player.put("orientation", localPlayer.getOrientation());
+                                        
                                         // World location
                                         final WorldPoint worldLocation = localPlayer.getWorldLocation();
                                         if (worldLocation != null) {
@@ -4408,6 +4547,22 @@ public class IpcInputPlugin extends Plugin
                                         
                                         // Run energy
                                         player.put("runEnergy", client.getEnergy());
+                                        
+                                        // Movement state using pose animation
+                                        // 824 = running, 819 = walking, 808 = standing still
+                                        try {
+                                            final int poseAnimation = localPlayer.getPoseAnimation();
+                                            player.put("poseAnimation", poseAnimation);
+                                            player.put("isRunning", (poseAnimation == 824));
+                                            player.put("isWalking", (poseAnimation == 819));
+                                            player.put("isStanding", (poseAnimation == 808));
+                                        } catch (Exception e) {
+                                            // Fallback: assume standing
+                                            player.put("poseAnimation", -1);
+                                            player.put("isRunning", false);
+                                            player.put("isWalking", false);
+                                            player.put("isStanding", true);
+                                        }
                                         
                                         // Combat status
                                         player.put("isInteracting", localPlayer.isInteracting());
@@ -6418,32 +6573,10 @@ public class IpcInputPlugin extends Plugin
                 String qLower
         ) {
             // Name + actions from composition
-            final ObjectComposition comp = client.getObjectDefinition(id);
+            final ObjectComposition baseComp = client.getObjectDefinition(id);
+            final ObjectComposition comp = resolveObjectComposition(client, baseComp);
             String name = (comp != null) ? comp.getName() : null;
-            String[] actions = null;
-            
-            // Check for impostor IDs if name is null or empty
-            if (comp != null && (name == null || name.isEmpty() || "null".equals(name))) {
-                int[] impostorIds = comp.getImpostorIds();
-                if (impostorIds != null && impostorIds.length > 0) {
-                    // Try each impostor ID to find one with a valid name
-                    for (int impostorId : impostorIds) {
-                        if (impostorId != -1) {
-                            ObjectComposition impostorComp = client.getObjectDefinition(impostorId);
-                            if (impostorComp != null) {
-                                String impostorName = impostorComp.getName();
-                                if (impostorName != null && !impostorName.isEmpty() && !"null".equals(impostorName)) {
-                                    name = impostorName;
-                                    actions = impostorComp.getActions();
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if (comp != null) {
-                actions = comp.getActions();
-            }
+            String[] actions = (comp != null) ? comp.getActions() : null;
             
             final String nmLower = (name != null) ? name.toLowerCase() : "";
             if (qLower != null && !qLower.isEmpty() && !nmLower.equals(qLower)) return;
