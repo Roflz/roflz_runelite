@@ -822,6 +822,7 @@ net\runelite\api\gameval\DBTableID$GatheringEventEventsList.class
 net\runelite\api\MainBufferProvider.class
 net\runelite\api\gameval\DBTableID$HiscoresSkillInfo$Row.class
 net\runelite\api\gameval\InterfaceID$IcsFlashback.class
+net\runelite\api\gameval\InterfaceID$Patchy.class
 net\runelite\api\gameval\InterfaceID$PortTaskInfo.class
 net\runelite\api\gameval\DBTableID$Speedrun$Row.class
 net\runelite\api\gameval\SpriteID$IconSailingFacilities24x24.class
@@ -888,6 +889,7 @@ net\runelite\api\events\DecorativeObjectSpawned.class
 net\runelite\api\gameval\DBTableID$Vmq3TowerTrial3$Row.class
 net\runelite\api\gameval\DBTableID$Dt2LassarBarrier$Row.class
 net\runelite\api\gameval\DBTableID$SailingBoatHotspot$Row.class
+net\runelite\api\gameval\InterfaceID$MenuNew.class
 net\runelite\api\gameval\SpriteID$Magicoff2.class
 net\runelite\api\gameval\DBTableID$Didyouknow.class
 net\runelite\api\gameval\DBTableID$Dt2LassarBraziers.class
@@ -1469,6 +1471,7 @@ net\runelite\api\widgets\WidgetID.class
 net\runelite\api\IndexedSprite.class
 net\runelite\api\gameval\DBTableID$Quest.class
 net\runelite\api\gameval\DBTableID$SailingChartingMermaidGuide.class
+net\runelite\api\gameval\DBTableID$PatchyData.class
 net\runelite\api\gameval\DBTableID$GatheringEventChanceData$Row.class
 net\runelite\api\gameval\SpriteID$League5RelicsTli.class
 net\runelite\api\gameval\InterfaceID$HorrorPrayerbooks.class
@@ -1507,6 +1510,7 @@ net\runelite\api\gameval\DBTableID$SailingChartingDrinkCrate.class
 net\runelite\api\gameval\DBTableID$OmnishopPurseData.class
 net\runelite\api\gameval\InterfaceID$GauntletMap.class
 net\runelite\api\gameval\SpriteID$League4Relics.class
+net\runelite\api\gameval\DBTableID$PatchyData$Row.class
 net\runelite\api\gameval\InterfaceID$SoulWarsRewards.class
 net\runelite\api\TextureProvider.class
 net\runelite\api\gameval\DBTableID$Vmq4MetzliBossSpecialTeleport$Row.class
@@ -2085,7 +2089,6 @@ net\runelite\api\gameval\SpriteID$SideIcons.class
 net\runelite\api\gameval\SpriteID$StandardCharge60.class
 net\runelite\api\gameval\InterfaceID$PvpArenaHud.class
 net\runelite\api\gameval\InterfaceID$WelcomeScreen.class
-net\runelite\api\gameval\InterfaceID$PatchyInterface.class
 net\runelite\api\gameval\SpriteID$Prayeroff.class
 net\runelite\api\gameval\SpriteID$League4RelicsLarge.class
 net\runelite\api\gameval\DBTableID$SailingShipwreckCluster.class

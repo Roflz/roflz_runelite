@@ -7,7 +7,7 @@
   <description>Open source RuneScape client</description>
   <groupId>net.runelite</groupId>
   <artifactId>runelite-maven-plugin</artifactId>
-  <version>1.12.7</version>
+  <version>1.12.11</version>
   <goalPrefix>runelite</goalPrefix>
   <mojos>
     <mojo>

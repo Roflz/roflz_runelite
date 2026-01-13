@@ -7,7 +7,7 @@
   <description>Open source RuneScape client</description>
   <groupId>net.runelite</groupId>
   <artifactId>runelite-maven-plugin</artifactId>
-  <version>1.12.7</version>
+  <version>1.12.11</version>
   <goalPrefix>runelite</goalPrefix>
   <isolatedRealm>false</isolatedRealm>
   <inheritedByDefault>true</inheritedByDefault>
@@ -128,7 +128,7 @@
       <groupId>net.runelite</groupId>
       <artifactId>cache</artifactId>
       <type>jar</type>
-      <version>1.12.7</version>
+      <version>1.12.11</version>
     </dependency>
     <dependency>
       <groupId>com.google.guava</groupId>
