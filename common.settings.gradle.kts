@@ -62,6 +62,14 @@ gradle.beforeProject {
 }
 
 gradle.afterProject {
+    if (plugins.hasPlugin("java")) {
+        extensions.getByType<org.gradle.api.plugins.JavaPluginExtension>().toolchain {
+            languageVersion.set(org.gradle.jvm.toolchain.JavaLanguageVersion.of(11))
+        }
+    }
+}
+
+gradle.afterProject {
     tasks.withType<Javadoc> {
         (this.options as StandardJavadocDocletOptions).apply {
             quiet()

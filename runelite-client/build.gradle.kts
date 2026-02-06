@@ -127,6 +127,17 @@ val shadowJar = tasks.register<Jar>("shadowJar") {
 }
 tasks.assemble { dependsOn(shadowJar) }
 
+// Run task for launching client (e.g. from bot launcher: -Puser.home=... -Prl.instance=0)
+tasks.register<JavaExec>("run") {
+    group = "application"
+    description = "Run RuneLite client (use -Puser.home=... -Prl.instance=0 for per-instance home)"
+    dependsOn(tasks.assemble)
+    mainClass.set("net.runelite.client.RuneLite")
+    classpath(sourceSets.main.get().runtimeClasspath)
+    systemProperty("user.home", project.findProperty("user.home")?.toString() ?: System.getProperty("user.home"))
+    systemProperty("rl.instance", project.findProperty("rl.instance")?.toString() ?: "0")
+}
+
 publishing {
     publications {
         create<MavenPublication>("runelite-client") {
