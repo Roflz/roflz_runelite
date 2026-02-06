@@ -37,3 +37,6 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+### Java HotSpot Error Logs ###
+hs_err_pid*.log

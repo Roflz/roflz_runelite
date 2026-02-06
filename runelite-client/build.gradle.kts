@@ -24,6 +24,9 @@
  */
 
 import java.io.ByteArrayOutputStream
+import org.gradle.jvm.toolchain.JavaLanguageVersion
+import org.gradle.jvm.toolchain.JvmVendorSpec
+import org.gradle.jvm.toolchain.JavaToolchainService
 
 plugins {
     java
@@ -42,6 +45,13 @@ lombok.version = libs.versions.lombok.get()
 java {
     withJavadocJar()
     withSourcesJar()
+    // Configure toolchain to use JDK 11 (Gradle will download via Foojay)
+    // This ensures we NEVER use system JDK, only Gradle-provisioned JDK
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(11))
+        // Prefer JDK over JRE
+        vendor.set(JvmVendorSpec.ADOPTIUM)
+    }
 }
 
 dependencies {
@@ -134,7 +144,30 @@ tasks.register<JavaExec>("run") {
     dependsOn(tasks.assemble)
     mainClass.set("net.runelite.client.RuneLite")
     classpath(sourceSets.main.get().runtimeClasspath)
-    systemProperty("user.home", project.findProperty("user.home")?.toString() ?: System.getProperty("user.home"))
+    
+    // Force use of project toolchain - ensures Gradle downloads and uses its own JDK
+    // This prevents using system JDK which may be incompatible (e.g., old JDK 11.0.2)
+    val toolchainService = project.extensions.getByType<JavaToolchainService>()
+    javaLauncher.set(toolchainService.launcherFor(java.toolchain))
+    
+    // Log toolchain JDK info when task executes (after launcher is resolved)
+    doFirst {
+        val launcher = javaLauncher.get()
+        val jdkPath = launcher.metadata.installationPath
+        val jdkVersion = launcher.metadata.languageVersion
+        println("=".repeat(70))
+        println("[RuneLite Launch] ✅ Using toolchain JDK:")
+        println("  Path: $jdkPath")
+        println("  Version: Java $jdkVersion")
+        println("  Vendor: ${launcher.metadata.vendor}")
+        println("=".repeat(70))
+    }
+    
+    // Redirect HotSpot error logs to instance directory instead of repository
+    val userHome = project.findProperty("user.home")?.toString() ?: System.getProperty("user.home")
+    jvmArgs("-XX:ErrorFile=${userHome}/hs_err_pid%p.log")
+    
+    systemProperty("user.home", userHome)
     systemProperty("rl.instance", project.findProperty("rl.instance")?.toString() ?: "0")
 }
 
